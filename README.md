@@ -16,6 +16,8 @@ It is the mobile companion of the [FlowMap Trade Terminal](https://github.com/na
 | **showMe** | Market monitor: heat tiles, sortable perpetuals table, watchlist, funding and open interest |
 
 > **Status:** 1.0.0, Android only, English only.
+>
+> **[Download the APK](https://github.com/nazmiefearmutcu/FlowMap-Mobile/releases/latest)**: a development-signed test build for Android 8.0 or later. Check it against `SHA256SUMS.txt`.
 
 ## Screens
 
