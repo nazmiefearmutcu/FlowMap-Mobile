@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="fm_bg">#FF05070D</color>
+    <color name="fm_icon_bg">#FF070A13</color>
+
+    <style name="Theme.FlowMap" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/fm_bg</item>
+        <item name="android:statusBarColor">@color/fm_bg</item>
+        <item name="android:navigationBarColor">@color/fm_bg</item>
+        <item name="android:windowLightStatusBar">false</item>
+    </style>
+</resources>
