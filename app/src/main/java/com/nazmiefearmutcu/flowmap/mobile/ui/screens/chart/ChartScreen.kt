@@ -37,7 +37,6 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
-import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -71,6 +70,7 @@ import com.nazmiefearmutcu.flowmap.mobile.ui.chart.Tooltip
 import com.nazmiefearmutcu.flowmap.mobile.ui.chart.drawBbo
 import com.nazmiefearmutcu.flowmap.mobile.ui.chart.drawCandles
 import com.nazmiefearmutcu.flowmap.mobile.ui.chart.drawLastPrice
+import com.nazmiefearmutcu.flowmap.mobile.ui.chart.drawPriceLine
 import com.nazmiefearmutcu.flowmap.mobile.ui.chart.drawSeries
 import com.nazmiefearmutcu.flowmap.mobile.ui.chart.drawTradeBubbles
 import com.nazmiefearmutcu.flowmap.mobile.ui.chart.lowerBound
@@ -97,7 +97,7 @@ fun ChartScreen(fullscreen: Boolean, onFullscreen: (Boolean) -> Unit) {
     val style by settings.style.collectAsState()
     val haptics by settings.haptics.collectAsState()
     val keepOn by settings.keepScreenOn.collectAsState()
-    var overlays by rememberSaveable { mutableStateOf(setOf(0, 1, 2)) }
+    var overlays by rememberSaveable { mutableStateOf(setOf(1, 2)) }
     var mode by rememberSaveable { mutableStateOf(DepthMode.TOTAL) }
     var panel by rememberSaveable { mutableStateOf(0) }
     var threshold by rememberSaveable { mutableStateOf(0.6f) }
@@ -111,6 +111,8 @@ fun ChartScreen(fullscreen: Boolean, onFullscreen: (Boolean) -> Unit) {
 
     val sess = session ?: return
     val st by sess.state.collectAsState()
+    // One viewport per market, shared by the heatmap and the CVD panel so both show the same time.
+    val vp = remember(sess) { ChartViewport() }
 
     Column(Modifier.fillMaxSize()) {
         if (!fullscreen) {
@@ -127,13 +129,14 @@ fun ChartScreen(fullscreen: Boolean, onFullscreen: (Boolean) -> Unit) {
             }
         }
         st.message?.takeIf { !st.synced && it != "Paused" }?.let { ErrorBanner(it, modifier = Modifier.padding(horizontal = 12.dp, vertical = 2.dp)) }
+        st.notice?.let { ErrorBanner(it, modifier = Modifier.padding(horizontal = 12.dp, vertical = 2.dp)) }
         Box(Modifier.weight(1f).fillMaxWidth()) {
-            LiveHeatmap(sess, st, mode, overlays, palette, threshold, style, haptics)
+            LiveHeatmap(sess, vp, st, mode, overlays, palette, threshold, style, haptics)
             IconButton(onClick = { onFullscreen(!fullscreen) }, modifier = Modifier.align(Alignment.TopEnd).padding(end = 58.dp)) {
                 Icon(if (fullscreen) Icons.Default.FullscreenExit else Icons.Default.Fullscreen, "Full screen", tint = Fm.text.copy(alpha = 0.8f))
             }
         }
-        if (4 in overlays) CvdPanel(sess, Modifier.fillMaxWidth().height(64.dp))
+        if (4 in overlays) CvdPanel(sess, vp, Modifier.fillMaxWidth().height(64.dp))
         if (!fullscreen) {
             Segmented(listOf("DOM", "Tape", "Hide"), panel, { panel = it }, Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp))
             when (panel) {
@@ -177,12 +180,14 @@ private fun fitLive(vp: ChartViewport, sess: LiveMarketSession, st: LiveState) {
     vp.follow = true
     vp.autoY = true
     val mid = if (!st.lastPrice.isNaN()) st.lastPrice else st.candles.lastOrNull()?.c ?: return
-    vp.set(now - 4 * 60_000.0, now + 30_000.0, mid * 0.997, mid * 1.003)
+    // Open on the last hour: reconstructed history on the left, live recording at the right edge.
+    vp.set(now - 60 * 60_000.0, now + 90_000.0, mid * 0.99, mid * 1.01)
 }
 
 @Composable
 private fun LiveHeatmap(
     sess: LiveMarketSession,
+    vp: ChartViewport,
     st: LiveState,
     mode: DepthMode,
     overlays: Set<Int>,
@@ -191,10 +196,12 @@ private fun LiveHeatmap(
     style: ChartStyle,
     haptics: Boolean,
 ) {
-    val vp = remember(sess) { ChartViewport() }
     val rasterizer = remember { HeatmapRasterizer() }
+    val historyRasterizer = remember { HeatmapRasterizer() }
     val depth = sess.depth
     depth.mode = mode
+    val history by sess.backfill.collectAsState()
+    history?.mode = mode
     val hasPrice = !st.lastPrice.isNaN() || st.candles.isNotEmpty()
 
     LaunchedEffect(sess, hasPrice) { if (hasPrice && !vp.initialized) fitLive(vp, sess, st) }
@@ -206,25 +213,29 @@ private fun LiveHeatmap(
         st.candles.firstOrNull()?.let { vp.dataStart = it.t.toDouble() }
         vp.followTo(now)
     }
-    // Auto-fit price to visible candles and best bid/offer until the user scales price.
-    LaunchedEffect(sess) {
-        snapshotFlow { Triple(vp.revision, vp.autoY, st.version) }.collect { (_, auto, _) ->
-            if (!auto || !vp.initialized) return@collect
-            var lo = Double.MAX_VALUE
-            var hi = -Double.MAX_VALUE
-            val cs = sess.state.value.candles
-            var i = cs.lowerBound(vp.xMin.toLong() - 60_000)
-            while (i < cs.size && cs[i].t <= vp.xMax) { lo = minOf(lo, cs[i].l); hi = maxOf(hi, cs[i].h); i++ }
-            val c0 = maxOf(0, depth.colAt(vp.xMin.toLong()))
-            val c1 = depth.colAt(vp.xMax.toLong())
-            var c = c0
-            while (c in 0..c1) {
-                val b = depth.bestBidAt(c); val a = depth.bestAskAt(c)
-                if (!b.isNaN()) { lo = minOf(lo, b); hi = maxOf(hi, a) }
-                c += 1
-            }
-            if (lo < hi) paddedRange(lo, hi, 0.35).let { vp.setY(it.first, it.second) }
+    // Price is fitted on request (first view, double-tap, double-tap on the price axis) and when
+    // new data arrives while following the live edge — never in response to panning, so
+    // navigation cannot change the scale. State is read fresh from the session, never captured.
+    fun fitY(force: Boolean = false) {
+        if (!vp.initialized || (!force && !vp.autoY)) return
+        var lo = Double.MAX_VALUE
+        var hi = -Double.MAX_VALUE
+        val cs = sess.state.value.candles
+        var i = cs.lowerBound(vp.xMin.toLong() - 60_000)
+        while (i < cs.size && cs[i].t <= vp.xMax) { lo = minOf(lo, cs[i].l); hi = maxOf(hi, cs[i].h); i++ }
+        val c0 = maxOf(0, depth.colAt(vp.xMin.toLong()))
+        val c1 = depth.colAt(vp.xMax.toLong())
+        var c = c0
+        while (c in 0..c1) {
+            val b = depth.bestBidAt(c); val a = depth.bestAskAt(c)
+            if (!b.isNaN()) { lo = minOf(lo, b); hi = maxOf(hi, a) }
+            c += 1
         }
+        if (lo < hi) paddedRange(lo, hi, 0.35).let { vp.setY(it.first, it.second) }
+    }
+    LaunchedEffect(st.version) { if (vp.follow) fitY() }
+    val vwap = remember(st.candles) {
+        if (st.candles.size > 2) LongArray(st.candles.size) { st.candles[it].t } to Indicators.vwap(st.candles) else null
     }
 
     Box(Modifier.fillMaxSize()) {
@@ -233,7 +244,8 @@ private fun LiveHeatmap(
             modifier = Modifier.fillMaxSize(),
             background = Color(palette.background),
             haptics = haptics,
-            onReset = { fitLive(vp, sess, sess.state.value) },
+            onReset = { fitLive(vp, sess, sess.state.value); fitY(force = true) },
+            onAutoFitY = { vp.autoY = true; fitY(force = true) },
             tooltipAt = { t, p ->
                 val lines = ArrayList<TipLine>()
                 val c = depth.colAt(t.toLong())
@@ -247,6 +259,15 @@ private fun LiveHeatmap(
                     val bu = depth.buyUsdAt(c); val su = depth.sellUsdAt(c)
                     if (bu > 0 || su > 0) lines += TipLine("Trades:", "${Fmt.usd(bu)} / ${Fmt.usd(su)}")
                 }
+                val bf = history
+                if (!inDepth && bf != null && t < bf.until) {
+                    val bc = bf.colAt(t.toLong())
+                    val br = bf.rowAt(p)
+                    if (bc >= 0 && br in 0 until bf.rows) {
+                        lines += TipLine("Volume memory:", Fmt.usd(bf.value(bc, br).toDouble()), Fm.yellow)
+                        lines += TipLine("Source:", "1-min candles, 2 h fade")
+                    }
+                }
                 val cs = st.candles
                 val k = cs.lowerBound(t.toLong() - 59_999)
                 if (k < cs.size && cs[k].t <= t) {
@@ -258,22 +279,18 @@ private fun LiveHeatmap(
             },
             drawPlot = { s ->
                 st.version // redraw on every new column
-                if (depth.cols > 0) {
-                    val img = rasterizer.render(depth, vp, s.width.toInt(), s.height.toInt(), palette, threshold, if (style == ChartStyle.PIXEL) 3 else 2, 0)
-                    if (img != null) drawImage(img, dstSize = IntSize(s.width.roundToInt(), s.height.roundToInt()), filterQuality = if (style == ChartStyle.PIXEL) FilterQuality.None else FilterQuality.Low)
+                val smooth = style == ChartStyle.SMOOTH
+                history?.let { bf -> with(historyRasterizer) { drawField(bf, vp, palette, threshold, smooth, dataKey = bf to mode) } }
+                if (depth.cols > 0) with(rasterizer) {
+                    drawField(depth, vp, palette, threshold, smooth, dataKey = st.version to mode)
                 }
+                // Candles when chosen; otherwise a price line over the heatmap (FlowMap's heat line).
                 if (0 in overlays) drawCandles(vp, st.candles, 60_000L, alpha = 0.85f)
-                if (3 in overlays && st.candles.size > 2) {
-                    val times = LongArray(st.candles.size) { st.candles[it].t }
-                    drawSeries(vp, times, Indicators.vwap(st.candles), Fm.yellow, 2f, 30_000L)
-                }
+                else drawPriceLine(vp, st.candles, if (depth.cols > 0) depth.colTime(0) else Long.MAX_VALUE)
+                if (3 in overlays && vwap != null) drawSeries(vp, vwap.first, vwap.second, Fm.yellow, 2f, 30_000L)
                 if (1 in overlays) drawBbo(vp, depth)
-                if (2 in overlays && depth.cols > 0) {
-                    var sum = 0.0
-                    var n = 0
-                    for (c in maxOf(0, depth.cols - 120) until depth.cols) { sum += depth.buyUsdAt(c) + depth.sellUsdAt(c); n++ }
-                    drawTradeBubbles(vp, depth, (sum / maxOf(1, n)).coerceAtLeast(1.0))
-                }
+                // Bubble sizes use a reference learnt once, so recorded bubbles never resize.
+                if (2 in overlays && depth.tradeRefUsd > 0) drawTradeBubbles(vp, depth, depth.tradeRefUsd)
                 drawLastPrice(vp, st.lastPrice, Fm.cyan)
                 // Marks where on-device recording started.
                 if (depth.cols > 0) {
@@ -282,8 +299,9 @@ private fun LiveHeatmap(
                 }
             },
             overlay = {
-                Row(Modifier.align(Alignment.TopStart).padding(8.dp)) {
-                    if (depth.cols == 0) ProvenanceBadge(Provenance.REST, extra = "candles · depth recording starts now")
+                Column(Modifier.align(Alignment.TopStart).padding(8.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    if (history != null) ProvenanceBadge(Provenance.ESTIMATE, extra = "history from 1-min candles")
+                    if (depth.cols == 0) ProvenanceBadge(Provenance.REST, extra = "order-book recording starts now")
                     else ProvenanceBadge(Provenance.LIVE_L2, extra = "recorded ${Fmt.ago(depth.colTime(0)).removeSuffix(" ago")}")
                 }
                 if (!vp.follow) {
@@ -302,27 +320,37 @@ private fun LiveHeatmap(
     }
 }
 
-/** Cumulative volume delta of aggressive trades since recording started. */
+/**
+ * Cumulative volume delta of aggressive trades since recording started, on the chart's own time
+ * axis. Its vertical range spans the whole recording, so navigating never rescales it.
+ */
 @Composable
-private fun CvdPanel(sess: LiveMarketSession, modifier: Modifier) {
+private fun CvdPanel(sess: LiveMarketSession, vp: ChartViewport, modifier: Modifier) {
     val st by sess.state.collectAsState()
     val d = sess.depth
     Box(modifier.background(Fm.surface)) {
         Canvas(Modifier.fillMaxSize().padding(end = 58.dp)) {
             st.version
+            vp.revision
             val n = d.cols
             if (n < 2) return@Canvas
-            var lo = Double.MAX_VALUE
-            var hi = -Double.MAX_VALUE
-            for (c in 0 until n) { val v = d.cvdAt(c); lo = minOf(lo, v); hi = maxOf(hi, v) }
-            if (hi - lo < 1e-9) hi = lo + 1
+            val lo = d.cvdMin
+            val hi = if (d.cvdMax - lo < 1e-9) lo + 1 else d.cvdMax
+            val sx = size.width / vp.plotW
+            val c0 = maxOf(0, d.colAt(vp.xMin.toLong()))
+            val c1 = minOf(n - 1, maxOf(c0, d.colAt(vp.xMax.toLong()) + 1))
             val p = Path()
-            for (c in 0 until n) {
-                val x = c / (n - 1f) * size.width
+            var started = false
+            for (c in c0..c1) {
+                // Break the line across recording gaps instead of bridging them.
+                if (c > c0 && d.isGap(d.colTime(c - 1), d.colTime(c))) started = false
+                val x = vp.xToPx(d.colTime(c) + d.colDurationMs.toDouble()) * sx
                 val y = (size.height - (d.cvdAt(c) - lo) / (hi - lo) * size.height * 0.85 - size.height * 0.07).toFloat()
-                if (c == 0) p.moveTo(x, y) else p.lineTo(x, y)
+                if (!started) { p.moveTo(x, y); started = true } else p.lineTo(x, y)
             }
-            drawPath(p, if (d.cvdAt(n - 1) >= d.cvdAt(0)) Fm.buy else Fm.sell, style = Stroke(2f))
+            val zero = (size.height - (0 - lo) / (hi - lo) * size.height * 0.85 - size.height * 0.07).toFloat()
+            drawLine(Fm.outline, Offset(0f, zero), Offset(size.width, zero), 1f)
+            drawPath(p, if (d.cvdAt(n - 1) >= 0) Fm.buy else Fm.sell, style = Stroke(2f))
         }
         Text("CVD ${if (d.cols > 0) Fmt.usd(d.cvdAt(d.cols - 1)) else ""}", color = Fm.textDim, fontSize = 11.sp, modifier = Modifier.padding(6.dp))
     }

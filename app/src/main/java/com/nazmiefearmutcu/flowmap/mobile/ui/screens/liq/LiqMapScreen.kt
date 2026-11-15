@@ -37,7 +37,6 @@ import androidx.compose.runtime.mutableDoubleStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
-import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -118,7 +117,7 @@ fun LiqMapScreen(fullscreen: Boolean, onFullscreen: (Boolean) -> Unit) {
                 Spacer(Modifier.width(12.dp))
                 Text("Liquidity Threshold = ${String.format(java.util.Locale.US, "%.2f", threshold)}", color = Fm.text, fontSize = 13.sp, style = Fm.num)
                 Slider(
-                    value = threshold, onValueChange = settings::setThreshold, valueRange = 0.05f..1f,
+                    value = threshold, onValueChange = settings::previewThreshold, onValueChangeFinished = settings::commitThreshold, valueRange = 0.05f..1f,
                     colors = SliderDefaults.colors(thumbColor = Color.White, activeTrackColor = Color(0xFF2F6BFF), inactiveTrackColor = Fm.surfaceTop),
                     thumb = { Box(Modifier.size(width = 40.dp, height = 26.dp).clip(RoundedCornerShape(50)).background(Color.White)) },
                     track = { st ->
@@ -144,10 +143,13 @@ fun LiqMapScreen(fullscreen: Boolean, onFullscreen: (Boolean) -> Unit) {
         Box(Modifier.weight(1f).fillMaxWidth()) {
             val h = ui.heatmap
             if (h != null) {
-                if (sub == 0) LiqHeatmapChart(h, palette, threshold, style, haptics)
-                else LiqMapBarsChart(h, haptics)
+                if (sub == 0) LiqHeatmapChart(h, ui.heatmapKey, palette, threshold, style, haptics)
+                else LiqMapBarsChart(h, ui.heatmapKey, haptics)
                 Row(Modifier.align(Alignment.TopStart).padding(8.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    ProvenanceBadge(Provenance.ESTIMATE, extra = if (h.usedOpenInterest) "OI ${ui.oiVenues.joinToString("+") { it.short }}" else "volume only")
+                    // Say how far back open interest reaches; earlier candles use the volume share.
+                    val partialOi = h.usedOpenInterest && h.oiCoverageFrom > h.colTime(0) + h.colDurationMs
+                    val oiLabel = "OI ${ui.oiVenues.joinToString("+") { it.short }}" + if (partialOi) " from ${Fmt.axisTime(h.oiCoverageFrom, 100L * 86_400_000L)}" else ""
+                    ProvenanceBadge(Provenance.ESTIMATE, extra = if (h.usedOpenInterest) oiLabel else "volume only")
                 }
             }
             if (ui.loading) CircularProgressIndicator(Modifier.align(Alignment.Center).size(36.dp), color = Fm.cyan)
@@ -179,28 +181,27 @@ private fun fitHeatmap(vp: ChartViewport, h: LiqHeatmap) {
 }
 
 @Composable
-private fun LiqHeatmapChart(h: LiqHeatmap, palette: HeatPalette, threshold: Float, style: ChartStyle, haptics: Boolean) {
-    val vp = remember { ChartViewport() }
+private fun LiqHeatmapChart(h: LiqHeatmap, fitKey: String, palette: HeatPalette, threshold: Float, style: ChartStyle, haptics: Boolean) {
+    // A new market, venue scope or range gets a fresh viewport (and so a fresh fit); a refresh or a
+    // model change of the same market keeps the user's zoom.
+    val vp = remember(fitKey) { ChartViewport() }
     val rasterizer = remember { HeatmapRasterizer() }
-    LaunchedEffect(h) {
-        // Keep the user's zoom when the same market refreshes; fit when the window changed.
-        val sameWindow = vp.initialized && kotlin.math.abs(vp.dataStart - h.colTime(0)) < h.colDurationMs * 3
-        if (!sameWindow) fitHeatmap(vp, h) else {
+    LaunchedEffect(h, vp) {
+        if (!vp.initialized) fitHeatmap(vp, h) else {
+            vp.dataStart = h.colTime(0).toDouble()
             vp.dataEnd = h.colTime(h.cols - 1).toDouble() + h.colDurationMs
         }
     }
-    // Auto-fit price to the visible candles while the user has not scaled price manually.
-    LaunchedEffect(h) {
-        snapshotFlow { Triple(vp.xMin, vp.xMax, vp.autoY) }.collect { (x0, x1, auto) ->
-            if (!auto) return@collect
-            val cs = h.candles
-            val a = cs.lowerBound(x0.toLong() - h.colDurationMs)
-            var lo = Double.MAX_VALUE
-            var hi = -Double.MAX_VALUE
-            var i = a
-            while (i < cs.size && cs[i].t <= x1) { lo = minOf(lo, cs[i].l); hi = maxOf(hi, cs[i].h); i++ }
-            if (lo < hi) paddedRange(lo, hi, 0.18).let { vp.setY(it.first, it.second) }
-        }
+    // Price is fitted only on request (first view, double-tap, double-tap on the price axis), never
+    // while panning: navigation must not change the scale under the user's finger.
+    fun fitVisiblePrice() {
+        val cs = h.candles
+        var lo = Double.MAX_VALUE
+        var hi = -Double.MAX_VALUE
+        var i = cs.lowerBound(vp.xMin.toLong() - h.colDurationMs)
+        while (i < cs.size && cs[i].t <= vp.xMax) { lo = minOf(lo, cs[i].l); hi = maxOf(hi, cs[i].h); i++ }
+        if (lo < hi) paddedRange(lo, hi, 0.18).let { vp.setY(it.first, it.second) }
+        vp.autoY = true
     }
     ChartFrame(
         viewport = vp,
@@ -208,21 +209,19 @@ private fun LiqHeatmapChart(h: LiqHeatmap, palette: HeatPalette, threshold: Floa
         background = Color(palette.background),
         haptics = haptics,
         onReset = { fitHeatmap(vp, h) },
+        onAutoFitY = { fitVisiblePrice() },
         tooltipAt = { t, p ->
             val c = h.colAt(t.toLong())
             val r = h.rowAt(p)
-            if (c < 0 || c >= h.cols || r < 0 || r >= h.rows) null
+            // Only inside the map: no value is reported where nothing is drawn.
+            if (c < 0 || c >= h.cols || t >= h.colTime(c) + h.colDurationMs || r < 0 || r >= h.rows) null
             else Tooltip(
                 Fmt.dateTime(h.colTime(c)),
                 listOf(TipLine("Price:", Fmt.price(p)), TipLine("Liquidation Leverage:", Fmt.compact(h.value(c, r).toDouble()))),
             )
         },
         drawPlot = { s ->
-            val img = rasterizer.render(
-                h, vp, s.width.toInt(), s.height.toInt(), palette, threshold,
-                cell = if (style == ChartStyle.PIXEL) 3 else 2, emptyColor = palette.background, gamma = 1.7,
-            )
-            if (img != null) drawImage(img, dstSize = IntSize(s.width.roundToInt(), s.height.roundToInt()), filterQuality = if (style == ChartStyle.PIXEL) FilterQuality.None else FilterQuality.Low)
+            with(rasterizer) { drawField(h, vp, palette, threshold, smooth = style == ChartStyle.SMOOTH, dataKey = h, gamma = 1.7) }
             drawCandles(vp, h.candles, h.colDurationMs, up = Color(0xFF26C281), down = Color(0xFFE5484D))
             drawLastPrice(vp, h.lastPrice, Fm.yellow)
             // Faint brand watermark, bottom-left.
@@ -235,19 +234,36 @@ private fun LiqHeatmapChart(h: LiqHeatmap, palette: HeatPalette, threshold: Floa
  * Liquidation map: estimated liquidation notional by price for each leverage tier (stacked
  * horizontal bars), with cumulative long (below price) and short (above price) curves.
  * Drag vertically to move, pinch to zoom, tap a bar to inspect it.
+ *
+ * Navigation never changes a number: buckets are fixed groups of the heatmap's price rows and the
+ * bar and curve scales come from a fixed band around the current price, so moving the view only
+ * moves the picture. Zooming switches between power-of-two bucket sizes; the tooltip always names
+ * the exact price range it sums.
  */
 @Composable
-private fun LiqMapBarsChart(h: LiqHeatmap, haptics: Boolean) {
+private fun LiqMapBarsChart(h: LiqHeatmap, viewKey: String, haptics: Boolean) {
     val price = h.lastPrice
-    var center by remember(h) { mutableDoubleStateOf(price) }
-    var span by remember(h) { mutableDoubleStateOf(price * 0.3) }
-    var heightPx by remember { mutableStateOf(1) }
-    var selected by remember(h) { mutableStateOf<Int?>(null) }
-    val buckets = (heightPx / 14).coerceIn(30, 140)
-    val bars = remember(h, center, span, buckets) { LiqMapBars.from(h, center - span / 2, center + span / 2, buckets) }
+    // View state survives refreshes and model changes of the same market (keyed on the request).
+    var center by remember(viewKey) { mutableDoubleStateOf(price) }
+    var span by remember(viewKey) { mutableDoubleStateOf(price * 0.3) }
+    // Bucket size depends only on the zoom level: about 60 buckets per screen height, rounded to a
+    // power-of-two number of heatmap rows, so neither scrolling nor a layout change regroups it.
+    val rowGroup = LiqMapBars.rowGroupFor(h, span / 60.0)
+    val bars = remember(h, rowGroup) { LiqMapBars.from(h, rowGroup) }
+    // Scales from a fixed ±25% band around the current price: independent of scrolling (they change
+    // only when the zoom level switches bucket size). Bars beyond the scale are marked as clipped.
+    val scales = remember(bars) {
+        val lo = bars.bucketAt(price * 0.75).coerceIn(0, bars.buckets - 1)
+        val hi = bars.bucketAt(price * 1.25).coerceIn(0, bars.buckets - 1)
+        val maxTotal = (lo..hi).maxOfOrNull { bars.total(it) }?.takeIf { it > 0 } ?: bars.maxTotal
+        val maxCum = (lo..hi).maxOfOrNull { maxOf(bars.cumulativeLong[it], bars.cumulativeShort[it]) }?.takeIf { it > 0 } ?: bars.maxCumulative
+        maxTotal to maxCum
+    }
+    var selectedPrice by remember(viewKey) { mutableStateOf<Double?>(null) }
     val barsNow = androidx.compose.runtime.rememberUpdatedState(bars)
     val measurer = rememberTextMeasurer()
     val labelStyle = TextStyle(color = Fm.text, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
+    val selected = selectedPrice?.let { bars.bucketAt(it) }?.takeIf { it in 0 until bars.buckets }
 
     Column(Modifier.fillMaxSize().background(Fm.bg)) {
         Row(Modifier.fillMaxWidth().padding(start = 12.dp, end = 12.dp, top = 36.dp, bottom = 4.dp), horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -263,23 +279,30 @@ private fun LiqMapBarsChart(h: LiqHeatmap, haptics: Boolean) {
             Text("Cum. short", color = Fm.buy, fontSize = 12.sp)
         }
         Box(
-            Modifier.weight(1f).fillMaxWidth().clipToBounds().onSizeChanged { heightPx = it.height }
+            Modifier.weight(1f).fillMaxWidth().clipToBounds()
                 .pointerInput(h) {
                     awaitEachGesture {
                         val down = awaitFirstDown()
                         var moved = 0f
+                        // Two fingers pan like one; they zoom only once their vertical spread has
+                        // clearly changed (8%), so the wobble of a two-finger drag never rescales.
+                        val pinch = com.nazmiefearmutcu.flowmap.mobile.ui.chart.PinchGate()
+                        var lastCount = 0
                         while (true) {
                             val ev = awaitPointerEvent()
                             val pressed = ev.changes.filter { it.pressed }
                             if (pressed.isEmpty()) break
                             if (pressed.size >= 2) {
-                                val a = pressed[0]
-                                val b = pressed[1]
-                                val prev = kotlin.math.abs(a.previousPosition.y - b.previousPosition.y)
-                                val cur = kotlin.math.abs(a.position.y - b.position.y)
-                                if (prev > 40f && cur > 40f) span = (span * prev / cur).coerceIn(price * 0.004, price * 1.2)
+                                val (pc, _, _) = com.nazmiefearmutcu.flowmap.mobile.ui.chart.spans(pressed.map { it.previousPosition })
+                                val (cc, csx, csy) = com.nazmiefearmutcu.flowmap.mobile.ui.chart.spans(pressed.map { it.position })
+                                if (pressed.size != lastCount) pinch.reset(csx, csy)
+                                lastCount = pressed.size
+                                center += (cc.y - pc.y) / size.height * span
+                                val (_, fy) = pinch.factors(csx, csy)
+                                if (fy != 1f) span = (span / fy).coerceIn(price * 0.004, price * 1.2)
                                 moved += 100f
                             } else {
+                                lastCount = 1
                                 val dy = pressed[0].positionChange().y
                                 moved += kotlin.math.abs(dy)
                                 center += dy / size.height * span
@@ -287,44 +310,46 @@ private fun LiqMapBarsChart(h: LiqHeatmap, haptics: Boolean) {
                             ev.changes.forEach { it.consume() }
                         }
                         if (moved < 12f) {
-                            val y = down.position.y
-                            val p = center + span / 2 - y / size.height * span
+                            val p = center + span / 2 - down.position.y / size.height * span
                             val cur = barsNow.value
-                            val b = ((p - cur.priceMin) / cur.bucket).toInt()
-                            selected = if (b in 0 until cur.buckets && selected != b) b else null
+                            val b = cur.bucketAt(p)
+                            val already = selectedPrice?.let { cur.bucketAt(it) } == b
+                            selectedPrice = if (b in 0 until cur.buckets && !already) cur.bucketPrice(b) else null
                         }
                     }
                 },
         ) {
-            val cumL = remember(bars) { bars.cumulativeLong() }
-            val cumS = remember(bars) { bars.cumulativeShort() }
+            val (maxTotal, maxCum) = scales
             Canvas(Modifier.fillMaxSize()) {
                 val axisW = 62.dp.toPx()
                 val plotW = size.width - axisW
-                val n = bars.buckets
-                val maxTotal = (0 until n).maxOfOrNull { bars.total(it) }?.takeIf { it > 0 } ?: 1.0
-                val maxCum = maxOf(cumL.maxOrNull() ?: 0.0, cumS.maxOrNull() ?: 0.0).takeIf { it > 0 } ?: 1.0
                 fun yOf(p: Double) = ((center + span / 2 - p) / span * size.height).toFloat()
-                val bh = size.height / n
-                for (b in 0 until n) {
-                    val yTop = yOf(bars.priceMin + (b + 1) * bars.bucket)
+                val b0 = bars.bucketAt(center - span / 2).coerceIn(0, bars.buckets - 1)
+                val b1 = bars.bucketAt(center + span / 2).coerceIn(0, bars.buckets - 1)
+                for (b in b0..b1) {
+                    val yTop = yOf(bars.bucketHigh(b))
+                    val bh = yOf(bars.bucketLow(b)) - yTop
                     var x = 0f
                     for (t in bars.tiers.indices) {
                         val v = bars.longs[t][b] + bars.shorts[t][b]
                         if (v <= 0) continue
-                        val w = (v / maxTotal * plotW * 0.92).toFloat()
+                        val w = (v / maxTotal * plotW * 0.92).toFloat().coerceAtMost(plotW - x)
                         drawRect(Fm.tierColors[t % Fm.tierColors.size].copy(alpha = if (selected == null || selected == b) 0.9f else 0.35f), Offset(x, yTop + 1f), Size(w, max(1f, bh - 2f)))
                         x += w
                     }
+                    // Clipped bar: a white end cap says "larger than the scale"; the tooltip has the value.
+                    if (bars.total(b) / maxTotal * 0.92 > 1.0) drawRect(Color.White, Offset(plotW - 4f, yTop + 1f), Size(4f, max(1f, bh - 2f)))
                 }
                 val lp = Path()
                 val sp = Path()
                 var ls = false
                 var ss = false
-                for (b in 0 until n) {
+                val cumL = bars.cumulativeLong
+                val cumS = bars.cumulativeShort
+                for (b in (b0 - 1).coerceAtLeast(0)..(b1 + 1).coerceAtMost(bars.buckets - 1)) {
                     val y = yOf(bars.bucketPrice(b))
-                    if (cumL[b] > 0) { val x = (cumL[b] / maxCum * plotW).toFloat(); if (!ls) { lp.moveTo(x, y); ls = true } else lp.lineTo(x, y) }
-                    if (cumS[b] > 0) { val x = (cumS[b] / maxCum * plotW).toFloat(); if (!ss) { sp.moveTo(x, y); ss = true } else sp.lineTo(x, y) }
+                    if (cumL[b] > 0) { val x = (cumL[b] / maxCum * plotW).toFloat().coerceAtMost(plotW); if (!ls) { lp.moveTo(x, y); ls = true } else lp.lineTo(x, y) }
+                    if (cumS[b] > 0) { val x = (cumS[b] / maxCum * plotW).toFloat().coerceAtMost(plotW); if (!ss) { sp.moveTo(x, y); ss = true } else sp.lineTo(x, y) }
                 }
                 drawPath(lp, Fm.sell, style = Stroke(2.5f))
                 drawPath(sp, Fm.buy, style = Stroke(2.5f))
@@ -346,19 +371,17 @@ private fun LiqMapBarsChart(h: LiqHeatmap, haptics: Boolean) {
                 drawText(tag, topLeft = Offset(plotW + 4.dp.toPx(), py - tag.size.height / 2))
             }
             selected?.let { b ->
-                if (b < bars.buckets) {
-                    Column(
-                        Modifier.align(Alignment.TopEnd).padding(top = 8.dp, end = 70.dp).clip(RoundedCornerShape(8.dp)).background(Color(0xF0101626))
-                            .padding(12.dp),
-                    ) {
-                        Text("${Fmt.price(bars.priceMin + b * bars.bucket)} – ${Fmt.price(bars.priceMin + (b + 1) * bars.bucket)}", color = Fm.text, fontWeight = FontWeight.Bold, fontSize = 13.sp, style = Fm.num)
-                        bars.tiers.forEachIndexed { t, tier ->
-                            val v = bars.longs[t][b] + bars.shorts[t][b]
-                            if (v > 0) Text("${tier.leverage}x  ${Fmt.usd(v)}", color = Fm.tierColors[t % Fm.tierColors.size], fontSize = 12.sp, style = Fm.num)
-                        }
-                        if (cumL[b] > 0) Text("Cum. long liq.  ${Fmt.usd(cumL[b])}", color = Fm.sell, fontSize = 12.sp, style = Fm.num)
-                        if (cumS[b] > 0) Text("Cum. short liq.  ${Fmt.usd(cumS[b])}", color = Fm.buy, fontSize = 12.sp, style = Fm.num)
+                Column(
+                    Modifier.align(Alignment.TopEnd).padding(top = 8.dp, end = 70.dp).clip(RoundedCornerShape(8.dp)).background(Color(0xF0101626))
+                        .padding(12.dp),
+                ) {
+                    Text("${Fmt.price(bars.bucketLow(b))} – ${Fmt.price(bars.bucketHigh(b))}", color = Fm.text, fontWeight = FontWeight.Bold, fontSize = 13.sp, style = Fm.num)
+                    bars.tiers.forEachIndexed { t, tier ->
+                        val v = bars.longs[t][b] + bars.shorts[t][b]
+                        if (v > 0) Text("${tier.leverage}x  ${Fmt.usd(v)}", color = Fm.tierColors[t % Fm.tierColors.size], fontSize = 12.sp, style = Fm.num)
                     }
+                    if (bars.cumulativeLong[b] > 0) Text("Cum. long liq.  ${Fmt.usd(bars.cumulativeLong[b])}", color = Fm.sell, fontSize = 12.sp, style = Fm.num)
+                    if (bars.cumulativeShort[b] > 0) Text("Cum. short liq.  ${Fmt.usd(bars.cumulativeShort[b])}", color = Fm.buy, fontSize = 12.sp, style = Fm.num)
                 }
             }
             Text(

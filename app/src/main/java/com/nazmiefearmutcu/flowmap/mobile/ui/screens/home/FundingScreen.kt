@@ -78,6 +78,7 @@ fun FundingScreen() {
 
     LaunchedEffect(Unit) {
         while (true) {
+            AppGraph.awaitForeground()
             try {
                 coroutineScope {
                     val b = async { try { AppGraph.tickers(Venue.BINANCE) } catch (_: Exception) { emptyList() } }

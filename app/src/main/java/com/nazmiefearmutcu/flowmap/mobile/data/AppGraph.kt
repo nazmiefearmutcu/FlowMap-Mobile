@@ -7,6 +7,7 @@ import com.nazmiefearmutcu.flowmap.mobile.data.live.LiquidationHub
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
@@ -26,6 +27,11 @@ object AppGraph {
 
     fun init(context: Context) {
         if (!::settings.isInitialized) settings = Settings(context.applicationContext)
+    }
+
+    /** Suspends while the app is in the background; polling loops call it before each request. */
+    suspend fun awaitForeground() {
+        foreground.first { it }
     }
 
     fun setForeground(visible: Boolean) {
@@ -52,11 +58,11 @@ object AppGraph {
         }
     }
 
-    private val tickerMutex = Mutex()
-    private val tickerCache = HashMap<Venue, Pair<Long, List<Ticker>>>()
+    private val tickerMutexes = Venue.entries.associateWith { Mutex() }
+    private val tickerCache = java.util.concurrent.ConcurrentHashMap<Venue, Pair<Long, List<Ticker>>>()
 
-    /** 24 h tickers with a 15-second cache per venue. */
-    suspend fun tickers(venue: Venue, maxAgeMs: Long = 15_000): List<Ticker> = tickerMutex.withLock {
+    /** 24 h tickers with a 15-second cache. One lock per venue, so the two venues load in parallel. */
+    suspend fun tickers(venue: Venue, maxAgeMs: Long = 15_000): List<Ticker> = tickerMutexes.getValue(venue).withLock {
         val hit = tickerCache[venue]
         if (hit != null && System.currentTimeMillis() - hit.first < maxAgeMs) return hit.second
         val fresh = Venues.api(venue).tickers()

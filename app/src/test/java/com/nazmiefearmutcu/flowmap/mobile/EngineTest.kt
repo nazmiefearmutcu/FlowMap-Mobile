@@ -56,24 +56,133 @@ class EngineTest {
     @Test
     fun liqMapBarsSplitLongsBelowAndShortsAbove() {
         val h = LiqHeatmapEngine.build(flat(40, 100.0), emptyList(), LiqModel.MODEL_2, hour)!!
-        val bars = LiqMapBars.from(h, 80.0, 120.0, 40)
-        val cumL = bars.cumulativeLong()
-        val cumS = bars.cumulativeShort()
+        val bars = LiqMapBars.from(h, 4)
+        val cumL = bars.cumulativeLong
+        val cumS = bars.cumulativeShort
         assertTrue(cumL.first() > 0 && cumL.last() == 0.0)
         assertTrue(cumS.last() > 0 && cumS.first() == 0.0)
     }
 
     @Test
-    fun mergeOiSumsVenues() {
+    fun liqMapBarsDependOnlyOnDataAndZoom() {
+        val h = LiqHeatmapEngine.build(flat(40, 100.0), emptyList(), LiqModel.MODEL_1, hour)!!
+        // Same zoom level → identical buckets and totals, whatever part of the map is on screen.
+        val a = LiqMapBars.from(h, 8)
+        val b = LiqMapBars.from(h, 8)
+        assertEquals(a.bucket, b.bucket, 0.0)
+        assertEquals(a.priceMin, b.priceMin, 0.0)
+        for (k in 0 until a.buckets) assertEquals(a.total(k), b.total(k), 0.0)
+        // Buckets are whole groups of rows, so every zoom level preserves the map's grand total.
+        val rowsTotal = h.model.tiers.indices.sumOf { t -> (0 until h.rows).sumOf { r -> (h.finalLong[t][r] + h.finalShort[t][r]).toDouble() } }
+        for (g in listOf(1, 2, 4, 16)) {
+            val bars = LiqMapBars.from(h, g)
+            assertEquals(rowsTotal, (0 until bars.buckets).sumOf { bars.total(it) }, rowsTotal * 1e-9)
+            assertEquals(g * h.priceStep, bars.bucket, 1e-12)
+        }
+        // Zoom levels are powers of two rows.
+        val g = LiqMapBars.rowGroupFor(h, h.priceStep * 5)
+        assertEquals(8, g)
+    }
+
+    @Test
+    fun mergeOiOnlySumsWhereEveryVenueHasData() {
         val a = listOf(OiPoint(0, 10.0), OiPoint(10, 20.0), OiPoint(20, 30.0))
         val b = listOf(OiPoint(5, 1.0), OiPoint(15, 2.0))
         val m = LiqHeatmapEngine.mergeOi(listOf(a, b))
-        assertEquals(listOf(10.0, 21.0, 32.0), m.map { it.usd })
+        // t=0 is dropped: venue b has no data yet, and adding it later must not look like new positions.
+        assertEquals(listOf(10L, 20L), m.map { it.t })
+        assertEquals(listOf(21.0, 32.0), m.map { it.usd })
+    }
+
+    @Test
+    fun mergeOiStartingLateProducesNoJump() {
+        // Long series (Bybit, flat 100) and a short one (Binance, flat 50) starting later.
+        val long = (0 until 100).map { OiPoint(it * 10L, 100.0) }
+        val short = (50 until 100).map { OiPoint(it * 10L, 50.0) }
+        val m = LiqHeatmapEngine.mergeOi(listOf(long, short))
+        assertTrue(m.all { it.usd == 150.0 })
+    }
+
+    @Test
+    fun crossedBookDropsTheStaleBid() {
+        val b = OrderBook()
+        b.replace(listOf(100.0 to 1.0, 99.0 to 1.0), listOf(101.0 to 1.0, 102.0 to 1.0))
+        // An ask update lands below a stale bid: the bid is the stale side.
+        b.apply(emptyList(), listOf(99.5 to 2.0))
+        assertEquals(99.0, b.bestBid, 0.0)
+        assertEquals(99.5, b.bestAsk, 0.0)
+        assertEquals(101.0, b.asks.higherKey(99.5)!!, 0.0) // real ask levels untouched
+    }
+
+    @Test
+    fun minuteBucketsKeepEveryMinuteRegardlessOfVolume() {
+        val m = com.nazmiefearmutcu.flowmap.mobile.engine.MinuteBuckets(60)
+        val now = 10_000L * 60_000L + 30_000L
+        // 5 000 events spread across the hour: none may be lost.
+        repeat(5_000) { i -> m.add(now - (i % 60) * 60_000L, 1.0, i % 2 == 0, now) }
+        val (l, s) = m.snapshot(now)
+        assertEquals(5_000.0, l.sum() + s.sum(), 1e-9)
+        // Events older than an hour are ignored entirely.
+        m.add(now - 61 * 60_000L, 7.0, true, now)
+        val (l1, s1) = m.snapshot(now)
+        assertEquals(5_000.0, l1.sum() + s1.sum(), 1e-9)
+        // The window slides: one minute later the oldest minute has left it.
+        val (l2, s2) = m.snapshot(now + 60_000L)
+        val oldest = l.first() + s.first()
+        assertEquals(5_000.0 - oldest, l2.sum() + s2.sum(), 1e-9)
+        // A venue clock a few seconds ahead still counts, in the current minute.
+        m.add(now + 45_000L, 3.0, false, now)
+        assertEquals(3.0 + s.last(), m.snapshot(now).second.last(), 1e-9)
+    }
+
+    @Test
+    fun cumulativeCurvesSplitTheBucketHoldingThePrice() {
+        val h = LiqHeatmapEngine.build(flat(40, 100.0), emptyList(), LiqModel.MODEL_1, hour)!!
+        // Coarse buckets so the bucket containing the price also holds liquidation rows on both sides.
+        val bars = LiqMapBars.from(h, 64)
+        val rowsLong = h.model.tiers.indices.sumOf { t -> (0 until h.rows).filter { h.rowPrice(it) <= h.lastPrice }.sumOf { h.finalLong[t][it].toDouble() } }
+        val rowsShort = h.model.tiers.indices.sumOf { t -> (0 until h.rows).filter { h.rowPrice(it) >= h.lastPrice }.sumOf { h.finalShort[t][it].toDouble() } }
+        assertEquals(rowsLong, bars.cumulativeLong.maxOrNull()!!, rowsLong * 1e-9)
+        assertEquals(rowsShort, bars.cumulativeShort.maxOrNull()!!, rowsShort * 1e-9)
+        // The partial top bucket never claims prices above the map.
+        assertEquals(h.priceMin + h.rows * h.priceStep, bars.bucketHigh(bars.buckets - 1), 1e-9)
+    }
+
+    @Test
+    fun rowAtFloorsBelowTheMap() {
+        val h = LiqHeatmapEngine.build(flat(10, 100.0), emptyList(), LiqModel.MODEL_1, hour)!!
+        assertEquals(-1, h.rowAt(h.priceMin - h.priceStep * 0.5))
+        assertEquals(0, h.rowAt(h.priceMin + h.priceStep * 0.5))
+    }
+
+    @Test
+    fun recordedDepthSurvivesLargeMoves() {
+        val d = DepthHeatmap(capacity = 100, windowRows = 100)
+        fun one(p: Double, q: Double) = TreeMap<Double, Double>(reverseOrder()).apply { put(p, q) }
+        fun askOf(p: Double) = TreeMap<Double, Double>().apply { put(p, 1.0) }
+        // A wall at 99.0 recorded around 100, then price runs 8% higher (beyond the ±6% window).
+        d.record(0, one(99.0, 10.0), askOf(100.02), 99.0, 100.02, TradeAccumulator())
+        val before = d.bidAt(0, d.rowAt(99.0))
+        for (i in 1..40) { val m = 100.0 + i * 0.2; d.record(i * 1000L, one(m - 0.01, 1.0), askOf(m + 0.01), m - 0.01, m + 0.01, TradeAccumulator()) }
+        assertTrue(before > 0f)
+        // The first column still reports exactly what was recorded, at the same price.
+        assertEquals(before, d.bidAt(0, d.rowAt(99.0)), 0f)
+        assertTrue(d.rowAt(108.0) in 0 until d.rows) // and the field now also covers the new prices
+    }
+
+    @Test
+    fun depthColourScaleIsHeldAfterWarmup() {
+        val d = DepthHeatmap(capacity = 200, windowRows = 50)
+        fun book(q: Double) = TreeMap<Double, Double>(reverseOrder()).apply { put(99.99, q) } to TreeMap<Double, Double>().apply { put(100.01, q) }
+        repeat(DepthHeatmap.WARMUP) { val (b, a) = book(1.0); d.record(1000L * it, b, a, 99.99, 100.01, TradeAccumulator()) }
+        val learnt = d.scaleMax
+        repeat(20) { val (b, a) = book(1.5); d.record(100_000L + 1000L * it, b, a, 99.99, 100.01, TradeAccumulator()) }
+        assertEquals("history must keep its colours", learnt, d.scaleMax, 0f)
     }
 
     @Test
     fun depthHeatmapRecordsBinsAndRecentres() {
-        val d = DepthHeatmap(capacity = 10, rows = 100)
+        val d = DepthHeatmap(capacity = 10, windowRows = 100)
         val bids = TreeMap<Double, Double>(reverseOrder()).apply { put(99.99, 5.0); put(99.5, 2.0) }
         val asks = TreeMap<Double, Double>().apply { put(100.01, 3.0) }
         val acc = TradeAccumulator().apply { add(100.0, 1.0, true) }

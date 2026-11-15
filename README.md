@@ -15,7 +15,7 @@ It is the mobile companion of the [FlowMap Trade Terminal](https://github.com/na
 | **Awareness** | Curated tier 1–3 publisher feeds, a quality gate against promotional headlines, story clustering and headline tone |
 | **showMe** | Market monitor: heat tiles, sortable perpetuals table, watchlist, funding and open interest |
 
-> **Status:** 1.0.0, Android only, English only.
+> **Status:** 1.0.1, Android only, English only. See the [changelog](CHANGELOG.md).
 >
 > **[Download the APK](https://github.com/nazmiefearmutcu/FlowMap-Mobile/releases/latest)**: a development-signed test build for Android 8.0 or later. Check it against `SHA256SUMS.txt`.
 
@@ -41,7 +41,7 @@ It is the mobile companion of the [FlowMap Trade Terminal](https://github.com/na
 | **Home › Longs/Shorts** | Global account, top-trader account, top-trader position and taker buy/sell ratios, from 5 m to 1 d |
 | **Home › Funding** | Funding rates of every perpetual on both venues side by side, plus funding history and 14-day open interest for the selected symbol |
 | **Markets** | Heat tiles of the most traded contracts, then search, sort (volume, gainers, losers, funding, price) and a starred watchlist. Tap a row to open the live chart; long-press it to open its Liq Map. |
-| **Chart** | FlowMap's liquidity heatmap: the order book recorded once per second on the device, with candles, best bid/offer, trade bubbles, VWAP and CVD. Choose Total, Bids or Asks; a DOM ladder or tape sits below. |
+| **Chart** | FlowMap's liquidity heatmap. It opens on the last hour: 12 hours of history are reconstructed from 1-minute candles (marked `ESTIMATE`), and the live order book, recorded once per second on the device, continues at the right edge. A white price line, best bid/offer, trade bubbles, VWAP and CVD can be drawn over it, with candles as an option. Choose Total, Bids or Asks; a DOM ladder or tape sits below. Switching to another symbol pauses the current recording and keeps it, for the two most recent markets. |
 | **News** | Stories from the Fed, ECB, BoE, BoJ, SEC, Bloomberg, WSJ, FT, CNBC, MarketWatch, The Economist, CoinDesk, Cointelegraph, Decrypt and The Block, grouped by event, with each publisher's tier |
 | **Me** | Venue, chart style, colour ramp, haptics and keep-screen-on settings; the gesture guide; data sources and the disclaimer |
 
@@ -52,7 +52,7 @@ Every chart uses one multi-touch engine. Any part of the chart can be reached wi
 | Gesture | Effect |
 |---|---|
 | One finger drag | Pans freely in time and price; a flick keeps it gliding |
-| Two or more fingers | Move together to pan. Pinch **sideways** to zoom time, **up and down** to zoom price, **diagonally** for both, always around your fingers |
+| Two or more fingers | Move together to pan. Pinch **sideways** to zoom time, **up and down** to zoom price, **diagonally** for both, always around your fingers. Zoom starts only after a clear spread or pinch (8%), so a two-finger drag never rescales by accident. |
 | Tap | Shows the crosshair and tooltip at that point; tap again to hide them |
 | Long-press and drag | Scrubs the crosshair, with a haptic tick |
 | Drag the price axis / time axis | Stretches that axis only |
@@ -80,6 +80,10 @@ FlowMap never presents an estimate as an observation. Every chart carries a badg
 | Model 3 (conservative) | 3x, 5x, 10x, 20x, 25x | 20 days |
 
 Binance serves only 30 days of open-interest history. For older candles, the model calibrates a turnover share on the period where open interest exists. The badge says `volume only` when no open interest was available at all.
+
+**Heatmap history.** No venue publishes past order books. So that the Chart opens on a full heatmap rather than a few seconds of recording, the app reconstructs 12 hours of history from 1-minute candles. Each candle's traded value is spread over its high–low range, peaking at the close (the band shape of FlowMap desktop's backfill). It is kept as a volume-at-price memory that fades with a 2-hour half-life, so heavily traded prices appear as horizontal bands. This part is labelled `ESTIMATE · history from 1-min candles`. A cyan line marks where the real recording starts.
+
+**Navigation never changes a value.** Panning moves the picture and nothing else. Heatmap cells are combined into fixed blocks tied to the data, liquidation-map buckets are fixed groups of price rows, and every colour and bar scale is set from the data, not from what is on screen. Zooming switches between power-of-two block sizes. Price auto-fit never runs during a pan: it applies on first view, on double-tap, and to new live data at the live edge. A two-finger drag only pans until the fingers clearly spread or pinch. The inspection crosshair is pinned to a time and price, not a screen position, so its tooltip keeps reporting the same cell while you pan. The live heatmap learns its colour scale over its first minute and then holds it, so recorded history keeps its colours.
 
 **Live data limits.** Venues publish liquidations live only, so totals start when the app opens and exclude time spent in the background. Binance sends at most one liquidation per symbol per second. The order-book heatmap exists only for the time the app has been recording: about 50 minutes at one column per second, kept in memory and never written to disk. If Binance refuses your region (HTTP 451/403), the app switches to Bybit and says so.
 

@@ -5,6 +5,7 @@ import com.nazmiefearmutcu.flowmap.mobile.data.Venue
 import com.nazmiefearmutcu.flowmap.mobile.data.stream.BinanceStreams
 import com.nazmiefearmutcu.flowmap.mobile.data.stream.BybitStreams
 import com.nazmiefearmutcu.flowmap.mobile.data.stream.StreamEvent
+import com.nazmiefearmutcu.flowmap.mobile.engine.MinuteBuckets
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -47,8 +48,10 @@ class LiquidationHub {
     private val since = System.currentTimeMillis()
     private val connected = HashMap<Venue, Boolean>()
     private var job: Job? = null
-    private var dirty = false
+    @Volatile private var dirty = false
     private var hadPause = false
+    private val minutes = MinuteBuckets(60)
+    @Volatile private var publishedMinute = 0L
 
     private val _state = MutableStateFlow(LiqFeedState(since = since))
     val state: StateFlow<LiqFeedState> = _state.asStateFlow()
@@ -62,7 +65,8 @@ class LiquidationHub {
             launch { BybitStreams.liquidations(bybitSymbols).collect { onEvent(Venue.BYBIT, it) } }
             while (isActive) {
                 delay(500)
-                if (dirty) publish()
+                // Also republish when the minute rolls over so the 60-minute chart keeps moving.
+                if (dirty || System.currentTimeMillis() / 60_000 != publishedMinute) publish()
             }
         }
     }
@@ -84,6 +88,7 @@ class LiquidationHub {
                 while (recent.size > 1500) recent.removeLast()
                 all = all.add(l)
                 totals[l.symbol] = (totals[l.symbol] ?: LiqTotals()).add(l)
+                minutes.add(l.time, l.usd, l.longLiquidated, System.currentTimeMillis())
                 dirty = true
             }
             else -> Unit
@@ -101,14 +106,8 @@ class LiquidationHub {
         val now = System.currentTimeMillis()
         val s = synchronized(lock) {
             dirty = false
-            val ml = DoubleArray(60)
-            val ms = DoubleArray(60)
-            val nowMin = now / 60_000
-            for (l in recent) {
-                val ago = (nowMin - l.time / 60_000).toInt()
-                if (ago !in 0..59) continue
-                if (l.longLiquidated) ml[59 - ago] += l.usd else ms[59 - ago] += l.usd
-            }
+            publishedMinute = now / 60_000
+            val (ml, ms) = minutes.snapshot(now)
             LiqFeedState(
                 since = since,
                 recent = recent.take(300),

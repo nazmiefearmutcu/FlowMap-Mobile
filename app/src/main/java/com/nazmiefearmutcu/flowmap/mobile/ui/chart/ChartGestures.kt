@@ -27,6 +27,44 @@ class ChartGestureCallbacks(
     val onInteraction: () -> Unit = {},
 )
 
+/**
+ * Holds back one axis of a pan until the gesture clearly means it. While price auto-fit is on,
+ * vertical movement is ignored until the finger has travelled [Y_UNLOCK_PX] mostly vertically; while
+ * following the live edge, horizontal movement is ignored until [X_UNLOCK_PX]. Once unlocked, the
+ * whole accumulated movement is applied so nothing is lost.
+ */
+internal class PanGate(private val autoY: Boolean, private val follow: Boolean) {
+    var xUnlocked = !follow
+        private set
+    var yUnlocked = !autoY
+        private set
+    private var heldX = 0f
+    private var heldY = 0f
+    private var totalX = 0f
+    private var totalY = 0f
+
+    fun filter(d: Offset): Offset {
+        totalX += d.x
+        totalY += d.y
+        var dx = d.x
+        var dy = d.y
+        if (!xUnlocked) {
+            heldX += d.x
+            if (abs(totalX) >= X_UNLOCK_PX) { xUnlocked = true; dx = heldX } else dx = 0f
+        }
+        if (!yUnlocked) {
+            heldY += d.y
+            if (abs(totalY) >= Y_UNLOCK_PX && abs(totalY) > abs(totalX)) { yUnlocked = true; dy = heldY } else dy = 0f
+        }
+        return Offset(dx, dy)
+    }
+
+    companion object {
+        const val X_UNLOCK_PX = 32f
+        const val Y_UNLOCK_PX = 48f
+    }
+}
+
 /** Span below which an axis does not take part in a pinch (fingers almost aligned on that axis). */
 private const val MIN_AXIS_SPAN_PX = 48f
 
@@ -44,6 +82,47 @@ internal fun spans(points: List<Offset>): Triple<Offset, Float, Float> {
 /** Per-axis scale factor from the change in finger span; 1 when that axis span is too small to read. */
 internal fun axisZoom(prevSpan: Float, curSpan: Float): Float =
     if (prevSpan > MIN_AXIS_SPAN_PX && curSpan > MIN_AXIS_SPAN_PX) (curSpan / prevSpan).coerceIn(0.5f, 2f) else 1f
+
+/**
+ * Keeps a two-finger drag a pure pan until the fingers clearly spread or pinch on an axis
+ * (span changed by more than [ZOOM_UNLOCK] since the fingers landed). The natural few-percent
+ * wobble of a two-finger drag therefore never rescales the chart. Once an axis unlocks, the
+ * change accumulated so far is applied at once, then zoom follows the fingers frame by frame.
+ */
+internal class PinchGate {
+    private var startX = 0f
+    private var startY = 0f
+    private var appliedX = 1f
+    private var appliedY = 1f
+    var xUnlocked = false
+        private set
+    var yUnlocked = false
+        private set
+
+    /** Call when the set of fingers changes; spans are measured from here. */
+    fun reset(spanX: Float, spanY: Float) {
+        startX = spanX; startY = spanY; appliedX = 1f; appliedY = 1f
+    }
+
+    /** Zoom factors to apply this frame for the current spans. */
+    fun factors(spanX: Float, spanY: Float): Pair<Float, Float> =
+        axis(spanX, startX, xUnlocked, appliedX) { u, a -> xUnlocked = u; appliedX = a } to
+            axis(spanY, startY, yUnlocked, appliedY) { u, a -> yUnlocked = u; appliedY = a }
+
+    private inline fun axis(cur: Float, start: Float, unlocked: Boolean, applied: Float, set: (Boolean, Float) -> Unit): Float {
+        if (start <= MIN_AXIS_SPAN_PX || cur <= MIN_AXIS_SPAN_PX) return 1f
+        val total = cur / start
+        if (!unlocked && kotlin.math.abs(total - 1f) < ZOOM_UNLOCK) return 1f
+        // Apply only the part of the total change not applied yet (the whole of it on unlock).
+        val f = (total / applied).coerceIn(0.5f, 2f)
+        set(true, applied * f)
+        return f
+    }
+
+    companion object {
+        const val ZOOM_UNLOCK = 0.08f
+    }
+}
 
 /**
  * Multi-touch chart gestures:
@@ -109,7 +188,11 @@ fun Modifier.chartGestures(viewport: ChartViewport, scope: CoroutineScope, cb: C
                     cb.onScrubEnd()
                 }
                 else -> {
-                    // Pan / pinch until every finger lifts.
+                    // Pan / pinch until every finger lifts. Small drift must not silently switch off
+                    // price auto-fit or LIVE follow: each unlocks only after a deliberate movement.
+                    val gate = PanGate(viewport.autoY, viewport.follow)
+                    val pinch = PinchGate()
+                    var lastCount = 0
                     var lastSingle = true
                     while (true) {
                         val ev: PointerEvent = awaitPointerEvent()
@@ -117,16 +200,20 @@ fun Modifier.chartGestures(viewport: ChartViewport, scope: CoroutineScope, cb: C
                         if (pressed.isEmpty()) break
                         pointerCount = maxOf(pointerCount, pressed.size)
                         if (pressed.size >= 2) {
-                            val (pc, psx, psy) = spans(pressed.map { it.previousPosition })
+                            val (pc, _, _) = spans(pressed.map { it.previousPosition })
                             val (cc, csx, csy) = spans(pressed.map { it.position })
-                            val pan = cc - pc
+                            if (pressed.size != lastCount) pinch.reset(csx, csy)
+                            lastCount = pressed.size
+                            val pan = gate.filter(cc - pc)
                             viewport.pan(pan.x, pan.y)
-                            viewport.zoom(axisZoom(psx, csx), axisZoom(psy, csy), cc.x, cc.y)
+                            val (fx, fy) = pinch.factors(csx, csy)
+                            if (fx != 1f || fy != 1f) viewport.zoom(fx, fy, cc.x, cc.y)
                             tracker.resetTracking()
                             lastSingle = false
                         } else {
+                            lastCount = 1
                             val ch = pressed[0]
-                            val d = ch.positionChange()
+                            val d = gate.filter(ch.positionChange())
                             if (!lastSingle) tracker.resetTracking()
                             viewport.pan(d.x, d.y)
                             tracker.addPosition(ch.uptimeMillis, ch.position)
@@ -138,8 +225,8 @@ fun Modifier.chartGestures(viewport: ChartViewport, scope: CoroutineScope, cb: C
                         val v = tracker.calculateVelocity()
                         if (hypot(v.x, v.y) > 350f) {
                             flingJob = scope.launch {
-                                var vx = v.x
-                                var vy = if (viewport.autoY) 0f else v.y
+                                var vx = if (gate.xUnlocked) v.x else 0f
+                                var vy = if (gate.yUnlocked) v.y else 0f
                                 var last = withFrameNanos { it }
                                 while (isActive && hypot(vx, vy) > 25f) {
                                     val now = withFrameNanos { it }

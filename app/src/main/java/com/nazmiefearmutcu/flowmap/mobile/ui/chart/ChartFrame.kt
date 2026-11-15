@@ -21,6 +21,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -80,9 +81,16 @@ fun ChartFrame(
     val scope = rememberCoroutineScope()
     val haptic = LocalHapticFeedback.current
     val measurer = rememberTextMeasurer(cacheSize = 96)
-    var cross by remember { mutableStateOf<Offset?>(null) }
+    // The inspected point is a (time, price) pair, not a screen position: panning moves the
+    // crosshair with the data, so the tooltip keeps reporting the same cell.
+    var mark by remember(viewport) { mutableStateOf<Pair<Double, Double>?>(null) }
+    fun toData(p: Offset) = viewport.pxToX(p.x) to viewport.pxToY(p.y)
     var sticky by remember { mutableStateOf(false) }
-    val density = LocalDensity.current
+    // Gesture handlers live as long as the viewport; read the latest lambdas and settings through
+    // these so a new heatmap, reset target or haptics choice takes effect immediately.
+    val onResetNow by rememberUpdatedState(onReset)
+    val onAutoFitNow by rememberUpdatedState(onAutoFitY)
+    val hapticsNow by rememberUpdatedState(haptics)
 
     Row(modifier.background(background)) {
         Column(Modifier.weight(1f).fillMaxHeight()) {
@@ -92,12 +100,12 @@ fun ChartFrame(
                     .chartGestures(
                         viewport, scope,
                         ChartGestureCallbacks(
-                            onTap = { p -> if (cross != null && sticky) { cross = null; sticky = false } else { cross = p; sticky = true } },
-                            onDoubleTap = { cross = null; sticky = false; onReset() },
-                            onScrubStart = { p -> if (haptics) haptic.performHapticFeedback(HapticFeedbackType.LongPress); cross = p; sticky = true },
-                            onScrub = { p -> cross = p },
+                            onTap = { p -> if (mark != null && sticky) { mark = null; sticky = false } else { mark = toData(p); sticky = true } },
+                            onDoubleTap = { mark = null; sticky = false; onResetNow() },
+                            onScrubStart = { p -> if (hapticsNow) haptic.performHapticFeedback(HapticFeedbackType.LongPress); mark = toData(p); sticky = true },
+                            onScrub = { p -> mark = toData(p) },
                             onScrubEnd = { },
-                            onInteraction = { if (!sticky) cross = null },
+                            onInteraction = { if (!sticky) mark = null },
                         ),
                     ),
             ) {
@@ -106,31 +114,35 @@ fun ChartFrame(
                     viewport.revision
                     viewport.plotW = size.width
                     viewport.plotH = size.height
-                    drawGrid(viewport, measurer)
                     clipRect { drawPlot(size) }
-                    cross?.let { drawCrosshair(it, size) }
+                    // Grid over the plot: the heatmap is opaque and would hide it.
+                    drawGrid(viewport)
+                    mark?.let { (t, p) -> drawCrosshair(Offset(viewport.xToPx(t), viewport.yToPx(p)), size) }
                 }
                 overlay()
-                val c = cross
-                if (c != null) {
-                    val tip = tooltipAt(viewport.pxToX(c.x), viewport.pxToY(c.y))
+                val m = mark
+                if (m != null) {
+                    viewport.revision // follow the data point while the view moves
+                    val c = Offset(viewport.xToPx(m.first), viewport.yToPx(m.second))
+                    val onScreen = c.x in 0f..viewport.plotW && c.y in 0f..viewport.plotH
+                    val tip = if (onScreen) tooltipAt(m.first, m.second) else null
                     if (tip != null) TooltipBox(tip, c)
                 }
             }
             // Time axis
-            Box(Modifier.fillMaxWidth().height(axisHeight).timeAxisGestures(viewport, onReset)) {
+            Box(Modifier.fillMaxWidth().height(axisHeight).timeAxisGestures(viewport) { onResetNow() }) {
                 Canvas(Modifier.fillMaxSize()) {
                     viewport.revision
-                    drawTimeAxis(viewport, measurer, cross?.x)
+                    drawTimeAxis(viewport, measurer, mark?.let { viewport.xToPx(it.first) })
                 }
             }
         }
         // Price axis
         Column(Modifier.width(axisWidth).fillMaxHeight()) {
-            Box(Modifier.weight(1f).fillMaxWidth().priceAxisGestures(viewport, onAutoFitY)) {
+            Box(Modifier.weight(1f).fillMaxWidth().priceAxisGestures(viewport) { onAutoFitNow() }) {
                 Canvas(Modifier.fillMaxSize()) {
                     viewport.revision
-                    drawPriceAxis(viewport, measurer, cross?.y)
+                    drawPriceAxis(viewport, measurer, mark?.let { viewport.yToPx(it.second) })
                 }
             }
             Spacer(Modifier.height(axisHeight))
@@ -139,7 +151,7 @@ fun ChartFrame(
 }
 
 private val axisStyle = TextStyle(color = Fm.text, fontSize = 11.sp, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Medium)
-private val gridColor = Color.White.copy(alpha = 0.05f)
+private val gridColor = Color.White.copy(alpha = 0.07f)
 
 private fun priceTicks(vp: ChartViewport, count: Int = 6): Pair<Double, List<Double>> {
     val step = Fmt.niceStep(vp.ySpan / count)
@@ -166,7 +178,7 @@ private fun timeTicks(vp: ChartViewport, count: Int = 4): List<Long> {
     return out
 }
 
-private fun DrawScope.drawGrid(vp: ChartViewport, measurer: androidx.compose.ui.text.TextMeasurer) {
+private fun DrawScope.drawGrid(vp: ChartViewport) {
     val (_, ticks) = priceTicks(vp)
     for (p in ticks) {
         val y = vp.yToPx(p)
@@ -186,7 +198,7 @@ private fun DrawScope.drawPriceAxis(vp: ChartViewport, measurer: androidx.compos
         if (y - layout.size.height / 2 < 0 || y + layout.size.height / 2 > size.height) continue
         drawText(layout, topLeft = Offset(6.dp.toPx(), y - layout.size.height / 2))
     }
-    if (crossY != null) {
+    if (crossY != null && crossY in 0f..size.height) {
         val label = measurer.measure(Fmt.price(vp.pxToY(crossY)), axisStyle.copy(color = Fm.bg, fontWeight = FontWeight.Bold))
         val h = label.size.height + 6.dp.toPx()
         val top = (crossY - h / 2).coerceIn(0f, size.height - h)
@@ -204,7 +216,7 @@ private fun DrawScope.drawTimeAxis(vp: ChartViewport, measurer: androidx.compose
         if (left < 0 || left + layout.size.width > size.width) continue
         drawText(layout, topLeft = Offset(left, (size.height - layout.size.height) / 2))
     }
-    if (crossX != null) {
+    if (crossX != null && crossX in 0f..size.width) {
         val label = measurer.measure(Fmt.dateTime(vp.pxToX(crossX).toLong()), axisStyle.copy(color = Fm.bg, fontWeight = FontWeight.Bold))
         val w = label.size.width + 8.dp.toPx()
         val left = (crossX - w / 2).coerceIn(0f, size.width - w)

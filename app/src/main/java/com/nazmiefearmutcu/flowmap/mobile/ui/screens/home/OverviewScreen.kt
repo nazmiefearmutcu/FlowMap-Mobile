@@ -70,6 +70,7 @@ fun OverviewScreen(onOpenChart: (String) -> Unit) {
     LaunchedEffect(Unit) { try { fng = FearGreedRepository.history(60) } catch (_: Exception) { } }
     LaunchedEffect(venuePref) {
         while (true) {
+            AppGraph.awaitForeground()
             try {
                 tickers = AppGraph.withVenue(venuePref) { AppGraph.tickers(it.venue) }.second
                 error = null

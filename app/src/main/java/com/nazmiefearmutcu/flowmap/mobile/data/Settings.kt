@@ -47,7 +47,9 @@ class Settings(context: Context) {
 
     fun setVenue(v: Venue) { _venue.value = v; prefs.edit().putInt("venue", v.ordinal).apply() }
     fun setPalette(p: HeatPalette) { _palette.value = p; prefs.edit().putInt("palette", p.ordinal).apply() }
-    fun setThreshold(t: Float) { _threshold.value = t; prefs.edit().putFloat("threshold", t).apply() }
+    /** Live preview while a slider moves; call [commitThreshold] when the drag ends to persist it. */
+    fun previewThreshold(t: Float) { _threshold.value = t }
+    fun commitThreshold() { prefs.edit().putFloat("threshold", _threshold.value).apply() }
     fun setStyle(s: ChartStyle) { _style.value = s; prefs.edit().putInt("style", s.ordinal).apply() }
     fun setSymbol(s: String) { _symbol.value = s; prefs.edit().putString("symbol", s).apply() }
     fun setHaptics(b: Boolean) { _haptics.value = b; prefs.edit().putBoolean("haptics", b).apply() }

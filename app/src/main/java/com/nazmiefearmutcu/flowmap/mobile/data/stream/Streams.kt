@@ -11,7 +11,7 @@ import kotlinx.coroutines.flow.buffer
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
-import kotlinx.coroutines.flow.filter
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.merge
 import kotlinx.coroutines.isActive
@@ -22,6 +22,7 @@ import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import org.json.JSONArray
 import org.json.JSONObject
+import java.util.concurrent.atomic.AtomicLong
 
 sealed interface StreamEvent {
     /** Order-book update. [snapshot] replaces the book; otherwise levels with qty 0 are removed. */
@@ -38,36 +39,51 @@ sealed interface StreamEvent {
     data class Trades(val list: List<Trade>) : StreamEvent
     data class Liq(val liq: Liquidation) : StreamEvent
     data class Kline(val candle: Candle, val closed: Boolean) : StreamEvent
-    data class Status(val connected: Boolean, val message: String? = null) : StreamEvent
+    /** Connection change. [aux] marks a secondary socket (Binance trades/klines) that does not carry the book. */
+    data class Status(val connected: Boolean, val message: String? = null, val aux: Boolean = false) : StreamEvent
 }
 
 /**
  * One WebSocket with automatic reconnection (exponential back-off, capped at 30 s).
  * [subscribe] messages are sent on every (re)connect; [ping] is sent every 20 s when given.
+ * When [silenceMs] > 0, a socket that delivers no message for that long is treated as dead and
+ * reopened: a venue that silently re-routes a stream must never keep reading as "live".
  */
 fun webSocketFlow(
     url: String,
     subscribe: List<String> = emptyList(),
     ping: String? = null,
+    silenceMs: Long = 0L,
     parse: (String) -> List<StreamEvent>,
 ): Flow<StreamEvent> = flow {
     var backoff = 1_000L
     while (true) {
         var opened = false
         val session = callbackFlow {
+            val lastMessage = AtomicLong(System.currentTimeMillis())
             val ws = Http.client.newWebSocket(Request.Builder().url(url).build(), object : WebSocketListener() {
                 override fun onOpen(webSocket: WebSocket, response: Response) {
+                    lastMessage.set(System.currentTimeMillis())
                     subscribe.forEach { webSocket.send(it) }
                     trySend(StreamEvent.Status(true))
                 }
 
                 override fun onMessage(webSocket: WebSocket, text: String) {
+                    lastMessage.set(System.currentTimeMillis())
                     val events = try {
                         parse(text)
                     } catch (_: Exception) {
                         emptyList()
                     }
                     events.forEach { trySend(it) }
+                }
+
+                // The server's close frame (Binance closes every 24 h) must be answered, otherwise
+                // onClosed never fires and the session hangs until a ping times out.
+                override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                    webSocket.close(1000, null)
+                    trySend(StreamEvent.Status(false, "Closed by venue: $reason"))
+                    close()
                 }
 
                 override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
@@ -89,8 +105,19 @@ fun webSocketFlow(
                     }
                 }
             }
+            val watchdog = if (silenceMs > 0) launch {
+                while (isActive) {
+                    delay(minOf(5_000L, silenceMs))
+                    if (System.currentTimeMillis() - lastMessage.get() > silenceMs) {
+                        trySend(StreamEvent.Status(false, "No data for ${silenceMs / 1000} s; reconnecting"))
+                        close()
+                        break
+                    }
+                }
+            } else null
             awaitClose {
                 pinger?.cancel()
+                watchdog?.cancel()
                 ws.cancel()
             }
         }.buffer(Channel.UNLIMITED) // never drop book diffs while the collector is busy
@@ -117,13 +144,16 @@ object BinanceStreams {
      */
     fun market(symbol: String): Flow<StreamEvent> {
         val s = symbol.lowercase()
-        val depth = webSocketFlow("$BASE/stream?streams=$s@depth@100ms", parse = ::parseCombined)
-        val trades = webSocketFlow("$BASE/market/stream?streams=$s@aggTrade/$s@kline_1m", parse = ::parseCombined)
-            .filter { it !is StreamEvent.Status }
+        // Limits are generous because both streams only push on change: a thin market can go quiet
+        // for a while, and a needless reconnect costs a resync. A truly dead route is still caught.
+        val depth = webSocketFlow("$BASE/stream?streams=$s@depth@100ms", silenceMs = 60_000L, parse = ::parseCombined)
+        val trades = webSocketFlow("$BASE/market/stream?streams=$s@aggTrade/$s@kline_1m", silenceMs = 10 * 60_000L, parse = ::parseCombined)
+            .map { if (it is StreamEvent.Status) it.copy(aux = true) else it }
         return merge(depth, trades)
     }
 
-    fun allLiquidations(): Flow<StreamEvent> = webSocketFlow("$BASE/market/ws/!forceOrder@arr", parse = ::parseCombined)
+    /** Liquidations can pause for minutes in a calm market, so the silence limit is generous. */
+    fun allLiquidations(): Flow<StreamEvent> = webSocketFlow("$BASE/market/ws/!forceOrder@arr", silenceMs = 15 * 60_000L, parse = ::parseCombined)
 
     fun parseCombined(text: String): List<StreamEvent> {
         val root = JSONObject(text)
@@ -179,11 +209,12 @@ object BybitStreams {
     private fun sub(topics: List<String>) = "{\"op\":\"subscribe\",\"args\":[" + topics.joinToString(",") { "\"$it\"" } + "]}"
 
     fun market(symbol: String): Flow<StreamEvent> =
-        webSocketFlow(URL, listOf(sub(listOf("orderbook.200.$symbol", "publicTrade.$symbol", "kline.1.$symbol"))), PING, ::parse)
+        webSocketFlow(URL, listOf(sub(listOf("orderbook.200.$symbol", "publicTrade.$symbol", "kline.1.$symbol"))), PING, 60_000L, ::parse)
 
     fun liquidations(symbols: List<String>): Flow<StreamEvent> =
         // One topic per request: a single unknown symbol would make Bybit reject a whole batch.
-        webSocketFlow(URL, symbols.map { sub(listOf("allLiquidation.$it")) }, PING, ::parse)
+        // Bybit answers every ping with a pong, so 90 s of silence means the link is dead.
+        webSocketFlow(URL, symbols.map { sub(listOf("allLiquidation.$it")) }, PING, 90_000L, ::parse)
 
     fun parse(text: String): List<StreamEvent> {
         val root = JSONObject(text)

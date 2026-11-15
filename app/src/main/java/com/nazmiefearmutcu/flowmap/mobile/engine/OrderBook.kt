@@ -17,9 +17,17 @@ class OrderBook {
     fun apply(b: List<Pair<Double, Double>>, a: List<Pair<Double, Double>>) {
         for ((p, q) in b) if (q <= 0.0) bids.remove(p) else bids[p] = q
         for ((p, q) in a) if (q <= 0.0) asks.remove(p) else asks[p] = q
-        // A crossed book after a missed update is self-healed by dropping the stale side.
+        // A crossed book means one side holds a level a missed update should have removed. The level
+        // this update just wrote is fresh, so the stale one is the crossing level on the other side.
         while (bids.isNotEmpty() && asks.isNotEmpty() && bids.firstKey() >= asks.firstKey()) {
-            if (b.isNotEmpty()) asks.pollFirstEntry() else bids.pollFirstEntry()
+            val bidFresh = b.any { it.first == bids.firstKey() && it.second > 0.0 }
+            val askFresh = a.any { it.first == asks.firstKey() && it.second > 0.0 }
+            when {
+                bidFresh && !askFresh -> asks.pollFirstEntry()
+                askFresh && !bidFresh -> bids.pollFirstEntry()
+                // Neither or both touched: drop both crossing levels rather than guess.
+                else -> { bids.pollFirstEntry(); asks.pollFirstEntry() }
+            }
         }
     }
 
@@ -27,20 +35,7 @@ class OrderBook {
     val bestAsk: Double get() = if (asks.isEmpty()) Double.NaN else asks.firstKey()
     val mid: Double get() = if (bids.isEmpty() || asks.isEmpty()) Double.NaN else (bestBid + bestAsk) / 2
 
-    /** Top [n] levels grouped into buckets of [group] price units (for the DOM ladder). */
-    fun ladder(n: Int, group: Double): Pair<List<Pair<Double, Double>>, List<Pair<Double, Double>>> {
-        fun grouped(src: Map<Double, Double>, floorFn: (Double) -> Double): List<Pair<Double, Double>> {
-            val out = LinkedHashMap<Double, Double>()
-            for ((p, q) in src) {
-                val k = floorFn(p)
-                out[k] = (out[k] ?: 0.0) + q
-                if (out.size > n) break
-            }
-            return out.entries.take(n).map { it.key to it.value }
-        }
-        val g = if (group > 0) group else 0.0
-        val b = if (g > 0) grouped(bids) { kotlin.math.floor(it / g) * g } else bids.entries.take(n).map { it.key to it.value }
-        val a = if (g > 0) grouped(asks) { kotlin.math.ceil(it / g) * g } else asks.entries.take(n).map { it.key to it.value }
-        return b to a
-    }
+    /** Top [n] levels of each side, best first, for the DOM ladder. */
+    fun ladder(n: Int): Pair<List<Pair<Double, Double>>, List<Pair<Double, Double>>> =
+        bids.entries.take(n).map { it.key to it.value } to asks.entries.take(n).map { it.key to it.value }
 }

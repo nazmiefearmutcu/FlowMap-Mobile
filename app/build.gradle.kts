@@ -44,8 +44,8 @@ android {
         applicationId = "com.nazmiefearmutcu.flowmap.mobile"
         minSdk = 26
         targetSdk = 36
-        versionCode = 1
-        versionName = "1.0.0"
+        versionCode = 2
+        versionName = "1.0.1"
         // English only for the first release; keeps other locales out of the APK.
         androidResources.localeFilters += listOf("en")
     }

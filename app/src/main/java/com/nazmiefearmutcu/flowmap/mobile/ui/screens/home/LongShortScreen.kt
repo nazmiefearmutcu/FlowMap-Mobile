@@ -36,6 +36,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.nazmiefearmutcu.flowmap.mobile.core.Fmt
 import com.nazmiefearmutcu.flowmap.mobile.data.AppGraph
+import com.nazmiefearmutcu.flowmap.mobile.data.HttpError
+import com.nazmiefearmutcu.flowmap.mobile.data.isRegionBlock
 import com.nazmiefearmutcu.flowmap.mobile.data.Interval
 import com.nazmiefearmutcu.flowmap.mobile.data.Provenance
 import com.nazmiefearmutcu.flowmap.mobile.data.RatioKind
@@ -49,6 +51,7 @@ import com.nazmiefearmutcu.flowmap.mobile.ui.components.ProvenanceBadge
 import com.nazmiefearmutcu.flowmap.mobile.ui.components.SplitBar
 import com.nazmiefearmutcu.flowmap.mobile.ui.components.SymbolPickerSheet
 import com.nazmiefearmutcu.flowmap.mobile.ui.theme.Fm
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 
@@ -74,7 +77,20 @@ fun LongShortScreen() {
         try {
             val (v, res) = AppGraph.withVenue(venuePref) { api ->
                 coroutineScope {
-                    api.ratioKinds.map { k -> async { k to try { api.longShort(symbol, k, periods[period], 120) } catch (_: Exception) { emptyList() } } }.map { it.await() }
+                    api.ratioKinds.map { k ->
+                        async {
+                            k to try {
+                                api.longShort(symbol, k, periods[period], 120)
+                            } catch (e: HttpError) {
+                                // A region block must reach withVenue so it can switch venue.
+                                if (e.isRegionBlock) throw e else emptyList()
+                            } catch (e: CancellationException) {
+                                throw e
+                            } catch (_: Exception) {
+                                emptyList()
+                            }
+                        }
+                    }.map { it.await() }
                 }
             }
             venue = v

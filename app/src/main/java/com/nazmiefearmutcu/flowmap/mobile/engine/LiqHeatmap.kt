@@ -189,41 +189,41 @@ object LiqHeatmapEngine {
         return out
     }
 
-    /** Sums several OI series (e.g. Binance + Bybit for the aggregated "Symbol" view) on the first one's timestamps. */
+    /**
+     * Sums several OI series (e.g. Binance + Bybit for the aggregated "Symbol" view) on the longest
+     * series' timestamps. A point is kept only where every series already has data: venues keep
+     * different history lengths (Binance 30 days), and summing a venue in only from its first point
+     * would read its entire open interest as positions opened in a single candle.
+     */
     fun mergeOi(series: List<List<OiPoint>>): List<OiPoint> {
         val nonEmpty = series.filter { it.isNotEmpty() }
         if (nonEmpty.isEmpty()) return emptyList()
         val base = nonEmpty.maxBy { it.size }
         val others = nonEmpty.filter { it !== base }
         val idx = IntArray(others.size) { -1 }
-        return base.map { p ->
+        val out = ArrayList<OiPoint>(base.size)
+        for (p in base) {
             var sum = p.usd
+            var complete = true
             others.forEachIndexed { k, s ->
                 while (idx[k] + 1 < s.size && s[idx[k] + 1].t <= p.t) idx[k]++
-                if (idx[k] >= 0) sum += s[idx[k]].usd
+                if (idx[k] >= 0) sum += s[idx[k]].usd else complete = false
             }
-            OiPoint(p.t, sum)
+            if (complete) out += OiPoint(p.t, sum)
         }
-    }
-
-    internal fun percentile(values: FloatArray, q: Double): Float {
-        var nz = 0
-        for (v in values) if (v > 0f) nz++
-        if (nz == 0) return 1f
-        val stride = max(1, nz / 20_000)
-        val sample = FloatArray((nz + stride - 1) / stride)
-        var k = 0
-        var seen = 0
-        for (v in values) if (v > 0f) {
-            if (seen % stride == 0 && k < sample.size) sample[k++] = v
-            seen++
-        }
-        val s = sample.copyOf(k).also { it.sort() }
-        return s[((s.size - 1) * q).toInt()].coerceAtLeast(1e-6f)
+        return out
     }
 }
 
-/** Liquidation-map bars: current liquidation notional per price bucket and leverage tier. */
+/**
+ * Liquidation-map bars: current liquidation notional per price bucket and leverage tier.
+ *
+ * Buckets are whole groups of the heatmap's own price rows, numbered from the heatmap's bottom row,
+ * so a bucket's boundaries and contents depend only on the data and the zoom level — never on where
+ * the view is scrolled. The cumulative curves are summed row by row against the current price, so
+ * the bucket that contains the price contributes its lower rows to longs and its upper rows to
+ * shorts. [maxTotal] and [maxCumulative] are whole-map fallbacks; the screen picks its own fixed band.
+ */
 class LiqMapBars(
     val priceMin: Double,
     val bucket: Double,
@@ -233,49 +233,72 @@ class LiqMapBars(
     /** [tier][bucket] short notional (above price) */
     val shorts: Array<DoubleArray>,
     val price: Double,
+    /** Top of the heatmap: the last bucket may be partial and must not claim prices above this. */
+    val priceTop: Double,
+    /** Long notional per bucket from rows at or below [price] only. */
+    private val longBelow: DoubleArray,
+    /** Short notional per bucket from rows at or above [price] only. */
+    private val shortAbove: DoubleArray,
 ) {
     val buckets: Int get() = longs.firstOrNull()?.size ?: 0
     fun bucketPrice(b: Int) = priceMin + (b + 0.5) * bucket
+    fun bucketLow(b: Int) = priceMin + b * bucket
+    fun bucketHigh(b: Int) = minOf(priceTop, priceMin + (b + 1) * bucket)
+    fun bucketAt(p: Double): Int = kotlin.math.floor((p - priceMin) / bucket).toInt()
     fun total(b: Int): Double = longs.sumOf { it[b] } + shorts.sumOf { it[b] }
 
     /** Cumulative long liquidations from price down to bucket [b] (0 above price). */
-    fun cumulativeLong(): DoubleArray {
-        val n = buckets
-        val out = DoubleArray(n)
+    val cumulativeLong: DoubleArray by lazy {
+        val out = DoubleArray(buckets)
         var acc = 0.0
-        for (b in n - 1 downTo 0) {
-            if (bucketPrice(b) <= price) acc += longs.sumOf { it[b] }
-            out[b] = if (bucketPrice(b) <= price) acc else 0.0
+        for (b in buckets - 1 downTo 0) {
+            acc += longBelow[b]
+            if (bucketLow(b) <= price) out[b] = acc
         }
-        return out
+        out
     }
 
-    fun cumulativeShort(): DoubleArray {
-        val n = buckets
-        val out = DoubleArray(n)
+    /** Cumulative short liquidations from price up to bucket [b] (0 below price). */
+    val cumulativeShort: DoubleArray by lazy {
+        val out = DoubleArray(buckets)
         var acc = 0.0
-        for (b in 0 until n) {
-            if (bucketPrice(b) >= price) acc += shorts.sumOf { it[b] }
-            out[b] = if (bucketPrice(b) >= price) acc else 0.0
+        for (b in 0 until buckets) {
+            acc += shortAbove[b]
+            if (bucketHigh(b) >= price) out[b] = acc
         }
-        return out
+        out
     }
+
+    val maxTotal: Double by lazy { (0 until buckets).maxOfOrNull { total(it) }?.takeIf { it > 0 } ?: 1.0 }
+    val maxCumulative: Double by lazy { maxOf(cumulativeLong.maxOrNull() ?: 0.0, cumulativeShort.maxOrNull() ?: 0.0).takeIf { it > 0 } ?: 1.0 }
 
     companion object {
-        /** Aggregates the heatmap's final state into [buckets] buckets inside [lo, hi]. */
-        fun from(h: LiqHeatmap, lo: Double, hi: Double, buckets: Int = 90): LiqMapBars {
-            val bucket = (hi - lo) / buckets
+        /** Smallest power-of-two row group giving buckets at least [minBucketPrice] tall. */
+        fun rowGroupFor(h: LiqHeatmap, minBucketPrice: Double): Int {
+            var g = 1
+            while (g * h.priceStep < minBucketPrice && g < h.rows) g *= 2
+            return g
+        }
+
+        /** Aggregates the whole heatmap's final state into buckets of [rowGroup] rows. */
+        fun from(h: LiqHeatmap, rowGroup: Int): LiqMapBars {
+            val g = rowGroup.coerceAtLeast(1)
+            val n = (h.rows + g - 1) / g
             val tiers = h.model.tiers
-            val longs = Array(tiers.size) { DoubleArray(buckets) }
-            val shorts = Array(tiers.size) { DoubleArray(buckets) }
+            val longs = Array(tiers.size) { DoubleArray(n) }
+            val shorts = Array(tiers.size) { DoubleArray(n) }
+            val price = h.lastPrice
+            val longBelow = DoubleArray(n)
+            val shortAbove = DoubleArray(n)
             for (t in tiers.indices) for (r in 0 until h.rows) {
-                val p = h.rowPrice(r)
-                if (p < lo || p >= hi) continue
-                val b = ((p - lo) / bucket).toInt().coerceIn(0, buckets - 1)
-                longs[t][b] += h.finalLong[t][r].toDouble()
-                shorts[t][b] += h.finalShort[t][r].toDouble()
+                val l = h.finalLong[t][r].toDouble()
+                val sh = h.finalShort[t][r].toDouble()
+                longs[t][r / g] += l
+                shorts[t][r / g] += sh
+                if (h.rowPrice(r) <= price) longBelow[r / g] += l
+                if (h.rowPrice(r) >= price) shortAbove[r / g] += sh
             }
-            return LiqMapBars(lo, bucket, tiers, longs, shorts, h.lastPrice)
+            return LiqMapBars(h.priceMin, g * h.priceStep, tiers, longs, shorts, price, h.priceMin + h.rows * h.priceStep, longBelow, shortAbove)
         }
     }
 }

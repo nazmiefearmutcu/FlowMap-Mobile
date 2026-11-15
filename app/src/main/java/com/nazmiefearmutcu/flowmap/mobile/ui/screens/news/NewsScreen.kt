@@ -1,7 +1,5 @@
 package com.nazmiefearmutcu.flowmap.mobile.ui.screens.news
 
-import android.content.Intent
-import android.net.Uri
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -44,6 +42,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.nazmiefearmutcu.flowmap.mobile.core.Fmt
+import com.nazmiefearmutcu.flowmap.mobile.core.openUrl
 import com.nazmiefearmutcu.flowmap.mobile.data.FearGreed
 import com.nazmiefearmutcu.flowmap.mobile.data.news.FearGreedRepository
 import com.nazmiefearmutcu.flowmap.mobile.data.news.FeedHealth
@@ -139,7 +138,7 @@ fun NewsScreen() {
                 if (ui.loading && ui.stories.isEmpty()) Box(Modifier.fillMaxWidth().padding(32.dp), contentAlignment = Alignment.Center) { CircularProgressIndicator(color = Fm.cyan) }
             }
             items(shown.take(150), key = { it.lead.url }) { s ->
-                StoryCard(s) { url -> ctx.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url))) }
+                StoryCard(s) { url -> ctx.openUrl(url) }
             }
         }
     }

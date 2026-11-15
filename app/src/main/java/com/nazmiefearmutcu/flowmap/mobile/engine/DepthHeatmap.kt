@@ -25,25 +25,37 @@ class TradeAccumulator {
  * Ring buffer of order-book columns: FlowMap's liquidity heatmap, recorded on the device.
  * Each column holds resting bid and ask notional (USD) per price bin at one sampling instant,
  * plus the best bid/offer and the trades that printed since the previous column.
+ *
+ * Recorded values are never rewritten. Each column stores [windowRows] bins around its own anchor
+ * (the price window in use when it was recorded); when price drifts, new columns simply use a new
+ * anchor. As a field the heatmap spans every anchor in the ring, so nothing recorded is ever
+ * dropped or moved. A spare physical slot lets a new column be written while the oldest one is
+ * still visible; [count]/[start] are published only after the column is complete.
  */
-class DepthHeatmap(val capacity: Int = 3000, override val rows: Int = 600) : HeatField {
+class DepthHeatmap(val capacity: Int = 3000, val windowRows: Int = 600) : HeatField {
     var binSize = 1.0
         private set
+    /** Anchor (absolute bin of row 0) used for new columns. */
     private var anchorBin = 0L
-    private val bid = FloatArray(capacity * rows)
-    private val ask = FloatArray(capacity * rows)
-    private val times = LongArray(capacity)
-    private val bestBid = DoubleArray(capacity) { Double.NaN }
-    private val bestAsk = DoubleArray(capacity) { Double.NaN }
-    private val buyUsd = DoubleArray(capacity)
-    private val sellUsd = DoubleArray(capacity)
-    private val buyVwap = DoubleArray(capacity) { Double.NaN }
-    private val sellVwap = DoubleArray(capacity) { Double.NaN }
-    private val cvd = DoubleArray(capacity)
-    private var start = 0
-    private var count = 0
+    private val slots = capacity + 1
+    private val bid = FloatArray(slots * windowRows)
+    private val ask = FloatArray(slots * windowRows)
+    private val times = LongArray(slots)
+    private val colAnchor = LongArray(slots)
+    private val bestBid = DoubleArray(slots) { Double.NaN }
+    private val bestAsk = DoubleArray(slots) { Double.NaN }
+    private val buyUsd = DoubleArray(slots)
+    private val sellUsd = DoubleArray(slots)
+    private val buyVwap = DoubleArray(slots) { Double.NaN }
+    private val sellVwap = DoubleArray(slots) { Double.NaN }
+    private val cvd = DoubleArray(slots)
+    @Volatile private var start = 0
+    @Volatile private var count = 0
+    /** Lowest and highest column anchor currently in the ring (the field's vertical extent). */
+    @Volatile private var minAnchor = 0L
+    @Volatile private var maxAnchor = 0L
     private var runningCvd = 0.0
-    private var scale = 1f
+    private var scale = 0f
     var mode = DepthMode.TOTAL
     var sampleMs = 1000L
 
@@ -52,17 +64,26 @@ class DepthHeatmap(val capacity: Int = 3000, override val rows: Int = 600) : Hea
         private set
 
     override val cols: Int get() = count
-    override val priceMin: Double get() = anchorBin * binSize
+    override val rows: Int get() = (maxAnchor - minAnchor).toInt() + windowRows
+    override val priceMin: Double get() = minAnchor * binSize
     override val priceStep: Double get() = binSize
     override val colDurationMs: Long get() = sampleMs
-    override val scaleMax: Float get() = scale
+    override val scaleMax: Float get() = if (scale > 0f) scale else 1f
 
-    private fun phys(c: Int) = (start + c) % capacity
+    private fun phys(c: Int) = (start + c) % slots
+
+    /** Index into the bid/ask arrays for field row [r] of column [c], or -1 outside that column's window. */
+    private fun cell(c: Int, r: Int): Int {
+        val p = phys(c)
+        val local = (minAnchor + r - colAnchor[p]).toInt()
+        return if (local in 0 until windowRows) p * windowRows + local else -1
+    }
 
     override fun colTime(c: Int): Long = times[phys(c)]
 
     override fun value(c: Int, r: Int): Float {
-        val i = phys(c) * rows + r
+        val i = cell(c, r)
+        if (i < 0) return 0f
         return when (mode) {
             DepthMode.TOTAL -> bid[i] + ask[i]
             DepthMode.BIDS -> bid[i]
@@ -70,8 +91,8 @@ class DepthHeatmap(val capacity: Int = 3000, override val rows: Int = 600) : Hea
         }
     }
 
-    fun bidAt(c: Int, r: Int): Float = bid[phys(c) * rows + r]
-    fun askAt(c: Int, r: Int): Float = ask[phys(c) * rows + r]
+    fun bidAt(c: Int, r: Int): Float = cell(c, r).let { if (it < 0) 0f else bid[it] }
+    fun askAt(c: Int, r: Int): Float = cell(c, r).let { if (it < 0) 0f else ask[it] }
     fun bestBidAt(c: Int) = bestBid[phys(c)]
     fun bestAskAt(c: Int) = bestAsk[phys(c)]
     fun buyUsdAt(c: Int) = buyUsd[phys(c)]
@@ -80,10 +101,15 @@ class DepthHeatmap(val capacity: Int = 3000, override val rows: Int = 600) : Hea
     fun sellVwapAt(c: Int) = sellVwap[phys(c)]
     fun cvdAt(c: Int) = cvd[phys(c)]
 
-    /** Chooses a bin of roughly one basis point and centres the window on [mid]. */
+    /**
+     * Chooses a bin of roughly two basis points and centres the window on [mid]: 600 rows span
+     * about ±6% around each column's anchor.
+     */
     fun init(mid: Double) {
-        binSize = Fmt.niceStep(mid * 0.0001)
-        anchorBin = floor(mid / binSize).toLong() - rows / 2
+        binSize = Fmt.niceStep(mid * 0.0002)
+        anchorBin = floor(mid / binSize).toLong() - windowRows / 2
+        minAnchor = anchorBin
+        maxAnchor = anchorBin
         initialized = true
     }
 
@@ -94,22 +120,29 @@ class DepthHeatmap(val capacity: Int = 3000, override val rows: Int = 600) : Hea
             init((bb + ba) / 2)
         }
         val mid = if (!bb.isNaN() && !ba.isNaN()) (bb + ba) / 2 else Double.NaN
-        if (!mid.isNaN()) recenterIfNeeded(mid)
-        val slot = if (count < capacity) { count++; phys(count - 1) } else { start = (start + 1) % capacity; phys(count - 1) }
-        val base = slot * rows
-        java.util.Arrays.fill(bid, base, base + rows, 0f)
-        java.util.Arrays.fill(ask, base, base + rows, 0f)
-        val lo = priceMin
+        if (!mid.isNaN()) {
+            // Keep the mid inside the middle 60% of the window for new columns; old columns keep theirs.
+            val r = floor((mid - anchorBin * binSize) / binSize).toLong()
+            if (r !in (windowRows / 5L) until (windowRows * 4L / 5)) anchorBin += r - windowRows / 2
+        }
+        // The spare slot is never visible, so writing it cannot tear a column that is being drawn.
+        val full = count >= capacity
+        val slot = (start + count) % slots
+        val base = slot * windowRows
+        java.util.Arrays.fill(bid, base, base + windowRows, 0f)
+        java.util.Arrays.fill(ask, base, base + windowRows, 0f)
+        val lo = anchorBin * binSize
         for ((p, q) in bids) {
             val r = floor((p - lo) / binSize).toInt()
             if (r < 0) break
-            if (r < rows) bid[base + r] += (p * q).toFloat()
+            if (r < windowRows) bid[base + r] += (p * q).toFloat()
         }
         for ((p, q) in asks) {
             val r = floor((p - lo) / binSize).toInt()
-            if (r >= rows) break
+            if (r >= windowRows) break
             if (r >= 0) ask[base + r] += (p * q).toFloat()
         }
+        colAnchor[slot] = anchorBin
         times[slot] = t
         bestBid[slot] = bb
         bestAsk[slot] = ba
@@ -119,48 +152,70 @@ class DepthHeatmap(val capacity: Int = 3000, override val rows: Int = 600) : Hea
         sellVwap[slot] = if (trades.sellQty > 0) trades.sellPq / trades.sellQty else Double.NaN
         runningCvd += trades.buyUsd - trades.sellUsd
         cvd[slot] = runningCvd
+        cvdMin = minOf(cvdMin, runningCvd)
+        cvdMax = maxOf(cvdMax, runningCvd)
+        updateTradeRef(trades.buyUsd + trades.sellUsd)
         updateScale(base)
+        // Publish: extend the field first if the new column's window lies outside it, then the column.
+        val newStart = if (full) (start + 1) % slots else start
+        val newCount = if (full) count else count + 1
+        var lo2 = Long.MAX_VALUE
+        var hi2 = Long.MIN_VALUE
+        for (c in 0 until newCount) {
+            val a = colAnchor[(newStart + c) % slots]
+            if (a < lo2) lo2 = a
+            if (a > hi2) hi2 = a
+        }
+        if (lo2 < minAnchor) minAnchor = lo2
+        if (hi2 > maxAnchor) maxAnchor = hi2
+        if (full) start = newStart else count = newCount
+        // Shrink only after the column is visible (an evicted column may have held the extreme anchor).
+        minAnchor = lo2
+        maxAnchor = hi2
     }
 
+    /**
+     * Colour scale, learnt from the first [WARMUP] columns and then held for good: recorded history
+     * never changes colour. Liquidity far above the learnt level simply saturates the top colour;
+     * the contrast control spreads it out again.
+     */
     private fun updateScale(base: Int) {
-        val tmp = FloatArray(rows)
+        if (scaleSamples >= WARMUP) return
+        val tmp = FloatArray(windowRows)
         var n = 0
-        for (r in 0 until rows) {
+        for (r in 0 until windowRows) {
             val v = bid[base + r] + ask[base + r]
             if (v > 0f) tmp[n++] = v
         }
         if (n == 0) return
         val s = tmp.copyOf(n).also { it.sort() }
         val p = s[((n - 1) * 0.985).toInt()]
-        scale = if (count <= 1) p else scale * 0.9f + p * 0.1f
+        scaleSamples++
+        scale += (p - scale) / scaleSamples
     }
 
-    /** Keeps the mid price inside the middle 60% of the window by shifting stored rows. */
-    private fun recenterIfNeeded(mid: Double) {
-        val r = ((mid - priceMin) / binSize).toInt()
-        if (r in (rows / 5) until (rows * 4 / 5)) return
-        val shift = r - rows / 2
-        val newAnchor = anchorBin + shift
-        for (c in 0 until count) {
-            val base = phys(c) * rows
-            shiftRows(bid, base, shift)
-            shiftRows(ask, base, shift)
-        }
-        anchorBin = newAnchor
+    /**
+     * Reference notional for trade-bubble size: the mean per-column traded value over the first
+     * [WARMUP] columns that printed, then held so existing bubbles never resize.
+     */
+    var tradeRefUsd = 0.0
+        private set
+    private var tradeRefSamples = 0
+    private var scaleSamples = 0
+
+    private fun updateTradeRef(usd: Double) {
+        if (usd <= 0.0 || tradeRefSamples >= WARMUP) return
+        tradeRefSamples++
+        tradeRefUsd += (usd - tradeRefUsd) / tradeRefSamples
     }
 
-    private fun shiftRows(a: FloatArray, base: Int, shift: Int) {
-        if (shift > 0) {
-            System.arraycopy(a, base + shift.coerceAtMost(rows), a, base, (rows - shift).coerceAtLeast(0))
-            java.util.Arrays.fill(a, base + (rows - shift).coerceAtLeast(0), base + rows, 0f)
-        } else if (shift < 0) {
-            val s = -shift
-            System.arraycopy(a, base, a, base + s.coerceAtMost(rows), (rows - s).coerceAtLeast(0))
-            java.util.Arrays.fill(a, base, base + s.coerceAtMost(rows), 0f)
-        }
-    }
+    /** CVD range over everything recorded, so its panel never rescales while you navigate. */
+    var cvdMin = 0.0
+        private set
+    var cvdMax = 0.0
+        private set
 
-    fun reset() {
-        start = 0; count = 0; runningCvd = 0.0; scale = 1f; initialized = false
+    companion object {
+        const val WARMUP = 60
     }
 }

@@ -55,7 +55,6 @@ fun DrawScope.drawSeries(vp: ChartViewport, times: LongArray, values: DoubleArra
         val v = values[i]
         if (v.isNaN()) { started = false; continue }
         val x = vp.xToPx((times[i] + offsetMs).toDouble())
-        if (x < -50 || x > size.width + 50) { started = false; continue }
         val y = vp.yToPx(v)
         if (!started) { path.moveTo(x, y); started = true } else path.lineTo(x, y)
     }
@@ -78,6 +77,8 @@ fun DrawScope.drawBbo(vp: ChartViewport, d: DepthHeatmap) {
         val yb = vp.yToPx(d.bestBidAt(c))
         val ya = vp.yToPx(d.bestAskAt(c))
         if (d.bestBidAt(c).isNaN()) { started = false; continue }
+        // A recording gap (app in background) is left open rather than bridged.
+        if (c > c0 && d.isGap(d.colTime(c - 1), d.colTime(c))) started = false
         if (!started) { bid.moveTo(x0, yb); ask.moveTo(x0, ya); started = true } else { bid.lineTo(x0, yb); ask.lineTo(x0, ya) }
         bid.lineTo(x1, yb); ask.lineTo(x1, ya)
     }
@@ -117,4 +118,25 @@ fun DrawScope.drawLastPrice(vp: ChartViewport, price: Double, color: Color) {
     val y = vp.yToPx(price)
     if (y < 0 || y > size.height) return
     drawLine(color.copy(alpha = 0.8f), Offset(0f, y), Offset(size.width, y), 1.4f, pathEffect = androidx.compose.ui.graphics.PathEffect.dashPathEffect(floatArrayOf(4f, 6f)))
+}
+
+/**
+ * Close-price line from 1-minute candles. Inside the live recording ([liveFrom] onwards) the best
+ * bid/offer already traces price, so the line stops there to avoid two competing price traces.
+ */
+fun DrawScope.drawPriceLine(vp: ChartViewport, candles: List<Candle>, liveFrom: Long, color: Color = Color.White) {
+    if (candles.size < 2) return
+    val from = max(0, candles.lowerBound((vp.xMin - 120_000).toLong()))
+    val path = Path()
+    var started = false
+    for (i in from until candles.size) {
+        val c = candles[i]
+        if (c.t > vp.xMax + 60_000) break
+        if (c.t + 60_000L > liveFrom) break
+        val x = vp.xToPx(c.t + 60_000.0)
+        val y = vp.yToPx(c.c)
+        if (!started) { path.moveTo(vp.xToPx(c.t.toDouble()), vp.yToPx(c.o)); started = true }
+        path.lineTo(x, y)
+    }
+    drawPath(path, color.copy(alpha = 0.92f), style = Stroke(2.2f))
 }

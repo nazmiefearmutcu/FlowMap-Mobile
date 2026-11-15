@@ -162,51 +162,79 @@ object FeedParser {
         return 0L
     }
 
-    fun stripHtml(s: String): String =
-        s.replace(Regex("<[^>]+>"), " ").replace("&nbsp;", " ").replace("&amp;", "&").replace("&quot;", "\"")
-            .replace("&#39;", "'").replace("&lt;", "<").replace("&gt;", ">").replace(Regex("\\s+"), " ").trim()
+    private val namedEntities = mapOf(
+        "&nbsp;" to " ", "&amp;" to "&", "&quot;" to "\"", "&apos;" to "'", "&lt;" to "<", "&gt;" to ">",
+        "&rsquo;" to "’", "&lsquo;" to "‘", "&rdquo;" to "”", "&ldquo;" to "“",
+        "&mdash;" to "—", "&ndash;" to "–", "&hellip;" to "…",
+    )
 
-    /** Parses RSS 2.0, RSS 1.0 (RDF) and Atom into (title, link, date, summary). */
+    fun stripHtml(s: String): String {
+        var t = s.replace(Regex("<[^>]+>"), " ")
+        for ((k, v) in namedEntities) t = t.replace(k, v)
+        t = t.replace(Regex("&#(x?)([0-9a-fA-F]+);")) { m ->
+            val code = m.groupValues[2].toIntOrNull(if (m.groupValues[1].isEmpty()) 10 else 16)
+            if (code != null && code in 1..0x10FFFF) String(Character.toChars(code)) else m.value
+        }
+        return t.replace(Regex("[ \\t\\r\\n]+"), " ").trim()
+    }
+
+    /**
+     * Parses RSS 2.0, RSS 1.0 (RDF) and Atom into (title, link, date, summary). Only direct children
+     * of an item are read, so nested elements such as media:title never leak into the headline.
+     * Relaxed mode keeps undeclared HTML entities (&rsquo;) from aborting the rest of the feed.
+     */
     fun parse(xml: String): List<RawEntry> {
         val p = Xml.newPullParser()
         p.setFeature(XmlPullParser.FEATURE_PROCESS_NAMESPACES, false)
+        runCatching { p.setFeature("http://xmlpull.org/v1/doc/features.html#relaxed", true) }
         p.setInput(StringReader(xml))
         val out = ArrayList<RawEntry>()
-        var inItem = false
+        var itemDepth = -1
         var title = ""
         var link = ""
         var date = ""
         var summary = ""
-        var tag = ""
+        var field = ""
         var ev = p.eventType
         while (ev != XmlPullParser.END_DOCUMENT) {
             when (ev) {
                 XmlPullParser.START_TAG -> {
-                    tag = p.name.substringAfter(':')
-                    if (tag == "item" || tag == "entry") {
-                        inItem = true; title = ""; link = ""; date = ""; summary = ""
-                    } else if (inItem && tag == "link") {
-                        val href = p.getAttributeValue(null, "href")
-                        val rel = p.getAttributeValue(null, "rel")
-                        if (href != null && (rel == null || rel == "alternate") && link.isEmpty()) link = href
+                    val name = p.name.substringAfter(':')
+                    if (itemDepth < 0 && (name == "item" || name == "entry")) {
+                        itemDepth = p.depth; title = ""; link = ""; date = ""; summary = ""; field = ""
+                    } else if (itemDepth >= 0 && p.depth == itemDepth + 1) {
+                        // Exact element names: a namespaced look-alike (media:title) is not a field.
+                        field = when (p.name) {
+                            "title" -> "title"
+                            "link" -> "link"
+                            "pubDate", "published", "updated", "dc:date" -> "date"
+                            "description", "summary", "content", "content:encoded" -> "summary"
+                            else -> ""
+                        }
+                        if (field == "link") {
+                            val href = p.getAttributeValue(null, "href")
+                            val rel = p.getAttributeValue(null, "rel")
+                            if (href != null && (rel == null || rel == "alternate") && link.isEmpty()) link = href
+                        }
                     }
                 }
-                XmlPullParser.TEXT, XmlPullParser.CDSECT -> if (inItem) {
+                XmlPullParser.TEXT, XmlPullParser.CDSECT, XmlPullParser.ENTITY_REF -> if (itemDepth >= 0 && p.depth == itemDepth + 1) {
                     val t = p.text ?: ""
-                    when (tag) {
+                    when (field) {
                         "title" -> title += t
-                        "link" -> if (t.isNotBlank()) link = t.trim()
-                        "pubDate", "published", "updated", "date" -> if (date.isBlank()) date = t
-                        "description", "summary", "encoded" -> if (summary.length < 600) summary += t
+                        "link" -> if (t.isNotBlank() && link.isEmpty()) link = t.trim()
+                        "date" -> if (date.isBlank()) date = t
+                        "summary" -> if (summary.length < 600) summary += t
                     }
                 }
                 XmlPullParser.END_TAG -> {
                     val name = p.name.substringAfter(':')
-                    if ((name == "item" || name == "entry") && inItem) {
-                        inItem = false
+                    if (itemDepth >= 0 && p.depth == itemDepth && (name == "item" || name == "entry")) {
+                        itemDepth = -1
                         if (title.isNotBlank() && link.isNotBlank()) out += RawEntry(stripHtml(title), link.trim(), parseDate(date), stripHtml(summary).take(280))
+                    } else if (itemDepth >= 0 && p.depth == itemDepth + 1) {
+                        field = ""
                     }
-                    tag = ""
                 }
             }
             // next() folds CDATA and entity references into TEXT events.

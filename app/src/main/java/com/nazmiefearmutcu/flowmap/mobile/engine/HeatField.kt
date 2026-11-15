@@ -21,7 +21,11 @@ interface HeatField {
     val scaleMax: Float
 
     fun rowPrice(r: Int): Double = priceMin + (r + 0.5) * priceStep
-    fun rowAt(price: Double): Int = ((price - priceMin) / priceStep).toInt()
+    /** Row holding [price]; negative below the map (floor, not truncation toward zero). */
+    fun rowAt(price: Double): Int = kotlin.math.floor((price - priceMin) / priceStep).toInt()
+
+    /** True when two consecutive column start times are far enough apart to be a recording gap. */
+    fun isGap(prevStart: Long, nextStart: Long): Boolean = nextStart - prevStart > colDurationMs * 3
 
     /** Largest column whose start time is ≤ [t], or -1 before the first column. */
     fun colAt(t: Long): Int {

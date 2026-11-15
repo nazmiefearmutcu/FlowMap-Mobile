@@ -19,7 +19,6 @@ enum class Interval(val ms: Long, val label: String, val binance: String, val by
     H2(7_200_000L, "2h", "2h", "120", null, "2h"),
     H4(14_400_000L, "4h", "4h", "240", "4h", "4h"),
     H6(21_600_000L, "6h", "6h", "360", null, "6h"),
-    H8(28_800_000L, "8h", "8h", "480", null, null),
     H12(43_200_000L, "12h", "12h", "720", null, "12h"),
     D1(86_400_000L, "1d", "1d", "D", "1d", "1d");
 }

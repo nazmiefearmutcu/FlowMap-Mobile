@@ -75,7 +75,9 @@ class ChartViewport {
         val ty = dy / plotH * ySpan
         if (dx != 0f) {
             xMin += tx; xMax += tx
-            if (dx > 0f) follow = false
+            // Any deliberate horizontal pan leaves the live edge (the gesture layer filters drift),
+            // so a move is never silently undone by the next live update.
+            follow = false
         }
         if (dy != 0f) {
             yMin += ty; yMax += ty

@@ -1,7 +1,5 @@
 package com.nazmiefearmutcu.flowmap.mobile.ui.screens.me
 
-import android.content.Intent
-import android.net.Uri
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -37,6 +35,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.nazmiefearmutcu.flowmap.mobile.BuildConfig
+import com.nazmiefearmutcu.flowmap.mobile.core.openUrl
 import com.nazmiefearmutcu.flowmap.mobile.data.AppGraph
 import com.nazmiefearmutcu.flowmap.mobile.data.ChartStyle
 import com.nazmiefearmutcu.flowmap.mobile.data.Venue
@@ -59,7 +58,7 @@ fun MeScreen() {
     val haptics by s.haptics.collectAsState()
     val keepOn by s.keepScreenOn.collectAsState()
     val ctx = LocalContext.current
-    fun open(url: String) = ctx.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+    fun open(url: String) = ctx.openUrl(url)
 
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(bottom = 24.dp)) {
         Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically) {

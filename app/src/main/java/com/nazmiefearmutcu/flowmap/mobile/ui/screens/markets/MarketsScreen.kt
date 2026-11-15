@@ -78,6 +78,7 @@ fun MarketsScreen(onOpenChart: (String) -> Unit, onOpenLiqMap: (String) -> Unit)
 
     LaunchedEffect(venue) {
         while (true) {
+            AppGraph.awaitForeground()
             try {
                 tickers = AppGraph.withVenue(venue) { AppGraph.tickers(it.venue) }.second
                 error = null
